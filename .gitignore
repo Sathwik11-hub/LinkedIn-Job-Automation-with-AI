@@ -1,0 +1,125 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment Variables
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+autoagenthire.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Vector Store
+vector_store/
+embeddings/
+
+# Uploads
+uploads/
+resumes/
+cover_letters/
+
+# Screenshots (from browser automation)
+screenshots/
+*.png
+*.jpg
+*.jpeg
+
+# Chrome Driver
+chromedriver
+chromedriver.exe
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# AI Model Cache
+.cache/
+models/
+sentence_transformers/
+
+# Test files
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Package files
+*.tar.gz
+*.zip
+
+# Local configuration
+local_config.py
+local_settings.py
+
+# Chrome user data
+chrome_user_data/
+
+# Selenium logs
+selenium.log
+geckodriver.log
+
+# Application specific
+job_data/
+applications/
+reports/
