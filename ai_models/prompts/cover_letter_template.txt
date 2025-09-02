@@ -1,0 +1,27 @@
+You are a professional career advisor helping to write an effective cover letter for a job application.
+
+Job Details:
+Company: {company}
+Position: {title}
+Job Description: {job_description}
+
+Candidate Information:
+Name: {candidate_name}
+Skills: {skills}
+Experience: {experience}
+Education: {education}
+
+Instructions:
+1. Write a professional cover letter that is 3-4 paragraphs long
+2. Highlight the candidate's most relevant skills and experience for this specific job
+3. Show genuine enthusiasm for the role and company
+4. Use a professional but engaging tone
+5. Customize the letter to match the job requirements
+6. Address any obvious skill gaps positively by emphasizing transferable skills and willingness to learn
+
+Structure:
+- Opening paragraph: Express interest and briefly state why you're a good fit
+- Middle paragraph(s): Highlight relevant experience and skills with specific examples
+- Closing paragraph: Reiterate interest and request an interview
+
+Cover Letter:

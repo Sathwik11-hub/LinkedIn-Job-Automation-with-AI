@@ -1,0 +1,30 @@
+Analyze the following job description and extract key information in JSON format.
+
+Job Description:
+{job_description}
+
+Extract and return the following information in valid JSON format:
+
+{{
+  "required_skills": [list of explicitly required technical and soft skills],
+  "preferred_skills": [list of preferred or nice-to-have skills],
+  "experience_years": "minimum years of experience required or range",
+  "education_requirements": "minimum education level required",
+  "key_responsibilities": [list of main job responsibilities],
+  "company_benefits": [list of benefits mentioned],
+  "job_type": "full-time/part-time/contract/internship",
+  "remote_option": true/false,
+  "location": "job location if specified",
+  "salary_range": "salary information if mentioned",
+  "industry": "industry or sector",
+  "company_size": "startup/small/medium/large if mentioned",
+  "urgency_level": "high/medium/low based on language used",
+  "application_deadline": "deadline if mentioned",
+  "key_qualifications": [top 5 most important qualifications],
+  "deal_breakers": [absolute requirements that cannot be compromised],
+  "growth_opportunities": [career advancement opportunities mentioned]
+}}
+
+Be thorough and accurate. If information is not available, use "not specified" or appropriate default values.
+
+Analysis:
