@@ -1,0 +1,37 @@
+Analyze how well the candidate's profile matches the job requirements and provide a detailed assessment.
+
+Job Information:
+Title: {job_title}
+Company: {company}
+Description: {job_description}
+Requirements: {job_requirements}
+
+Candidate Profile:
+Skills: {candidate_skills}
+Experience: {candidate_experience}
+Education: {candidate_education}
+Years of Experience: {years_experience}
+
+Provide your analysis in the following JSON format:
+
+{{
+  "match_score": "number between 0-100 representing overall fit",
+  "skill_match_percentage": "percentage of required skills the candidate has",
+  "experience_match": "how well experience aligns (excellent/good/fair/poor)",
+  "education_match": "how education requirements are met (exceeds/meets/below)",
+  "matching_skills": [list of candidate skills that match job requirements],
+  "missing_skills": [list of required skills the candidate lacks],
+  "transferable_skills": [candidate skills that could transfer to this role],
+  "strength_areas": [top 3 areas where candidate excels],
+  "weakness_areas": [top 3 areas needing improvement],
+  "recommendations": [specific suggestions for improving candidacy],
+  "interview_likelihood": "high/medium/low based on match quality",
+  "application_strategy": "tailored advice for this specific application",
+  "key_selling_points": [top 3 points to emphasize in application],
+  "risk_factors": [potential concerns employers might have],
+  "confidence_level": "high/medium/low for getting this job"
+}}
+
+Be honest and constructive in your assessment. Focus on actionable insights.
+
+Assessment:
