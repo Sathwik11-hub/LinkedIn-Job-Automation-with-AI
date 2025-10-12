@@ -1,0 +1,12 @@
+[general]
+email = ""
+
+[server]
+headless = true
+enableCORS = false
+
+[theme]
+primaryColor = "#FF6B6B"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F8F9FA"
+textColor = "#2E3A47"

@@ -225,12 +225,15 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # API Configuration
-API_URL = "http://127.0.0.1:50501"
+# Backend configuration
+BACKEND_URL = "http://127.0.0.1:58265"
+HEALTH_ENDPOINT = f"{BACKEND_URL}/health"
+JOB_SEARCH_ENDPOINT = f"{BACKEND_URL}/agents/job-search"
 
 def check_api_health():
     """Check if the backend API is available."""
     try:
-        response = requests.get(f"{API_URL}/health", timeout=5)
+        response = requests.get(f"{BACKEND_URL}/health", timeout=5)
         return response.status_code == 200
     except:
         return False
@@ -238,7 +241,7 @@ def check_api_health():
 def get_agent_status():
     """Get agent status from backend."""
     try:
-        response = requests.get(f"{API_URL}/api/agent/status", timeout=5)
+        response = requests.get(f"{BACKEND_URL}/api/agent/status", timeout=5)
         if response.status_code == 200:
             return response.json()
         return None
@@ -262,7 +265,7 @@ def run_automation(file, job_preferences):
         }
         
         response = requests.post(
-            f"{API_URL}/api/run-agent",
+            f"{BACKEND_URL}/api/run-agent",
             files=files,
             data=data,
             timeout=300
