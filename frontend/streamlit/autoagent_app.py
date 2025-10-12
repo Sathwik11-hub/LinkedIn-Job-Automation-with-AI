@@ -8,6 +8,11 @@ import time
 import json
 from typing import Optional
 
+# Backend configuration
+BACKEND_URL = "http://127.0.0.1:8000"
+HEALTH_ENDPOINT = f"{BACKEND_URL}/health"
+JOB_SEARCH_ENDPOINT = f"{BACKEND_URL}/agents/job-search"
+
 # Page config with custom theme
 st.set_page_config(
     page_title="AutoAgentHire - AI Job Automation",
@@ -226,9 +231,11 @@ st.markdown("""
 
 # API Configuration
 # Backend configuration
-BACKEND_URL = "http://127.0.0.1:58265"
+BACKEND_URL = "http://127.0.0.1:8000"
 HEALTH_ENDPOINT = f"{BACKEND_URL}/health"
 JOB_SEARCH_ENDPOINT = f"{BACKEND_URL}/agents/job-search"
+AUTOAGENT_ENDPOINT = f"{BACKEND_URL}/api/run-agent"
+AGENT_STATUS_ENDPOINT = f"{BACKEND_URL}/api/agent/status"
 
 def check_api_health():
     """Check if the backend API is available."""
@@ -241,7 +248,7 @@ def check_api_health():
 def get_agent_status():
     """Get agent status from backend."""
     try:
-        response = requests.get(f"{BACKEND_URL}/api/agent/status", timeout=5)
+        response = requests.get(AGENT_STATUS_ENDPOINT, timeout=5)
         if response.status_code == 200:
             return response.json()
         return None
@@ -265,7 +272,7 @@ def run_automation(file, job_preferences):
         }
         
         response = requests.post(
-            f"{BACKEND_URL}/api/run-agent",
+            AUTOAGENT_ENDPOINT,
             files=files,
             data=data,
             timeout=300
@@ -309,6 +316,63 @@ uvicorn backend.main:app --reload --host 127.0.0.1 --port 50501
                 st.markdown('<div class="status-badge status-success">💼 LinkedIn Ready</div>', unsafe_allow_html=True)
             else:
                 st.markdown('<div class="status-badge status-error">⚠️ LinkedIn Not Configured</div>', unsafe_allow_html=True)
+    
+    st.markdown("---")
+    
+    # Quick Start AutoAgent Section
+    st.markdown("### 🚀 Quick Start AutoAgent")
+    st.markdown("Start LinkedIn job automation with default settings or customize your preferences below.")
+    
+    quick_col1, quick_col2, quick_col3 = st.columns([2, 2, 1])
+    
+    with quick_col1:
+        quick_job_title = st.text_input("Job Title", value="AI Engineer", key="quick_job")
+    
+    with quick_col2:
+        quick_location = st.selectbox("Location", ["Remote", "United States", "India", "Canada"], key="quick_location")
+    
+    with quick_col3:
+        quick_run_button = st.button(
+            "🚀 Start AutoAgent",
+            type="primary",
+            use_container_width=True,
+            help="Start LinkedIn job automation with current settings"
+        )
+    
+    if quick_run_button:
+        # Quick start automation
+        st.info("🤖 Starting AutoAgent with quick settings...")
+        
+        quick_preferences = {
+            "job_title": quick_job_title,
+            "location": quick_location,
+            "experience_level": "mid",
+            "resume_path": "data/resumes/default_resume.txt"
+        }
+        
+        with st.spinner("🔄 Running AutoAgent automation..."):
+            result = run_automation(None, quick_preferences)
+            
+            if result and result.get("status") == "success":
+                st.success("✅ AutoAgent completed successfully!")
+                
+                # Show basic results
+                if "execution_summary" in result:
+                    exec_summary = result["execution_summary"]
+                    
+                    summary_col1, summary_col2, summary_col3 = st.columns(3)
+                    with summary_col1:
+                        st.metric("Jobs Found", exec_summary.get("total_jobs_found", 0))
+                    with summary_col2:
+                        st.metric("Applications Submitted", exec_summary.get("applications_submitted", 0))
+                    with summary_col3:
+                        st.metric("Success Rate", f"{exec_summary.get('success_rate', 0)}%")
+            else:
+                st.error("❌ AutoAgent automation failed. Please check your configuration.")
+    
+    st.markdown("---")
+    st.markdown("### ⚙️ Advanced Configuration")
+    st.markdown("For detailed customization, use the options below:")
     
     st.markdown("---")
     

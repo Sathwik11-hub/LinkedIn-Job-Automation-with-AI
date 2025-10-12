@@ -1,9 +1,7 @@
-[general]
-email = ""
-
 [server]
 headless = true
-enableCORS = false
+enableCORS = true
+enableXsrfProtection = false
 
 [theme]
 primaryColor = "#FF6B6B"

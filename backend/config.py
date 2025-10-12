@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     API_RELOAD: bool = True
     
     # Security
-    SECRET_KEY: str = Field(..., env="SECRET_KEY")
+    SECRET_KEY: str = "default-secret-key-change-in-production"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     PINECONE_INDEX_NAME: Optional[str] = None
     
     # OpenAI
-    OPENAI_API_KEY: str = Field(..., description="OpenAI API key (required, set via environment variable)")
+    OPENAI_API_KEY: str = "demo-key-replace-with-real-key"
     OPENAI_MODEL: str = "gpt-4-turbo-preview"
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
     OPENAI_MAX_TOKENS: int = 4000

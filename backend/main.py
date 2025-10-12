@@ -146,7 +146,96 @@ async def trigger_job_search_agent(request_data: dict):
 async def run_auto_apply_agent(request_data: dict):
     """Run the AutoAgentHire browser automation agent."""
     try:
-        from backend.agents.auto_apply_agent import run_autoagent
+        from backend.agents.auto_apply_agent_clean import run_autoagent
+        
+        # Extract parameters
+        job_criteria = request_data.get("job_criteria", {})
+        keywords = job_criteria.get("keywords", "software engineer")
+        location = job_criteria.get("location", "Remote")
+        max_applications = request_data.get("max_applications", 5)
+        resume_path = request_data.get("resume_path", "data/resumes/default_resume.txt")
+        
+        logger.info(f"🤖 Starting AutoAgent with criteria: {job_criteria}")
+        
+        # Run the AutoAgent
+        result = await run_autoagent(
+            keyword=keywords,
+            location=location,
+            resume_path=resume_path,
+            max_jobs=max_applications,
+            auto_apply=True
+        )
+        
+        return {
+            "status": "success",
+            "message": "AutoAgent completed successfully",
+            "results": result
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ AutoAgent failed: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"AutoAgent failed: {str(e)}"
+        }
+
+
+@app.get("/api/agent/status")
+async def get_agent_status():
+    """Get the current status of the AutoAgent."""
+    try:
+        return {
+            "status": "ready",
+            "message": "AutoAgent is ready to run",
+            "last_run": None,
+            "applications_submitted": 0
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Status check failed: {str(e)}"
+        }
+
+
+@app.post("/api/run-agent")
+async def trigger_autoagent(request_data: dict):
+    """Trigger the AutoAgent with job search and auto-apply."""
+    try:
+        from backend.agents.auto_apply_agent_clean import run_autoagent
+        
+        # Extract user preferences
+        preferences = request_data.get("preferences", {})
+        keywords = preferences.get("job_title", "software engineer")
+        location = preferences.get("location", "Remote")
+        experience_level = preferences.get("experience_level", "mid")
+        resume_path = preferences.get("resume_path", "data/resumes/default_resume.txt")
+        
+        logger.info(f"🚀 Triggering AutoAgent with preferences: {preferences}")
+        
+        # Start the automated job search and application process
+        result = await run_autoagent(
+            keyword=keywords,
+            location=location,
+            resume_path=resume_path,
+            experience_level=experience_level,
+            max_jobs=5,
+            auto_apply=True
+        )
+        
+        return {
+            "status": "success",
+            "message": "AutoAgent started successfully",
+            "job_search_results": result.get("jobs_found", []),
+            "applications_submitted": result.get("applications_submitted", 0),
+            "execution_summary": result.get("execution_summary", {})
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ AutoAgent trigger failed: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Failed to start AutoAgent: {str(e)}"
+        }
         
         # Extract parameters
         keyword = request_data.get("keyword", "Python Developer")
@@ -178,31 +267,11 @@ async def run_auto_apply_agent(request_data: dict):
         }
         
     except Exception as e:
-        logger.error(f"❌ AutoAgentHire error: {str(e)}")
+        logger.error(f"❌ AutoAgent trigger failed: {str(e)}")
         return {
             "status": "error",
-            "message": f"Automation failed: {str(e)}"
+            "message": f"Failed to start AutoAgent: {str(e)}"
         }
-
-
-@app.get("/api/agent/status")
-async def get_agent_status():
-    """Get the current status of automation agents."""
-    return {
-        "status": "operational",
-        "agents": {
-            "job_search": "available",
-            "auto_apply": "available",
-            "gemini_ai": "configured" if os.getenv("GEMINI_API_KEY") else "not_configured",
-            "linkedin": "configured" if os.getenv("LINKEDIN_EMAIL") else "not_configured"
-        },
-        "features": [
-            "Intelligent job matching",
-            "Automated applications", 
-            "AI-powered decision making",
-            "Resume analysis"
-        ]
-    }
 
 
 # File upload and agent endpoints
