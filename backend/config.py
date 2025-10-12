@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     API_RELOAD: bool = True
     
     # Security
-    SECRET_KEY: str = "default-secret-key-change-in-production"
+    SECRET_KEY: str = Field(..., env="SECRET_KEY")
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
