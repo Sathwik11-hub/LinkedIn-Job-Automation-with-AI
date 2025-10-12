@@ -607,34 +607,7 @@ if __name__ == "__main__":
     # Test run
     test_result = test_browser_setup()
     print("Browser Test Results:", test_result)
-import os
-import asyncio
-import time
-from typing import Dict, List, Optional, Any
-from pathlib import Path
-import logging
-
-# PDF processing
-try:
-    import fitz  # PyMuPDF
-    PDF_AVAILABLE = True
-except ImportError:
-    PDF_AVAILABLE = False
-
-# AI processing
-try:
-    import google.generativeai as genai
-    GENAI_AVAILABLE = True
-except ImportError:
-    GENAI_AVAILABLE = False
-    genai = None
-
-# Similarity processing
-try:
-    from sentence_transformers import SentenceTransformer
-    import numpy as np
-    SIMILARITY_AVAILABLE = True
-except ImportError:
+# (Removed duplicated imports and initialization code)
     SIMILARITY_AVAILABLE = False
 
 # Browser automation
