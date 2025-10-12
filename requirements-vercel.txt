@@ -1,0 +1,41 @@
+# FastAPI and Server - Core dependencies
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# AI Integration - Essential only
+google-generativeai==0.8.2
+openai==1.10.0
+tiktoken==0.5.2
+
+# Environment and Configuration
+python-dotenv==1.0.0
+aiofiles==24.1.0
+
+# Document Processing - Lightweight
+PyPDF2==3.0.1
+
+# Database - Lightweight
+sqlalchemy==2.0.25
+
+# HTTP and Web
+requests==2.31.0
+httpx==0.26.0
+
+# Data Processing
+pandas==2.1.4
+numpy==1.26.2
+
+# Utilities
+python-dateutil==2.8.2
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# Security
+cryptography==41.0.8
+
+# JSON and YAML
+pyyaml==6.0.1
+
+# Logging and Monitoring
+structlog==23.2.0

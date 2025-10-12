@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AutoAgentHire - AI Job Automation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: white;
+        }
+        
+        .container {
+            text-align: center;
+            max-width: 800px;
+            padding: 2rem;
+        }
+        
+        h1 {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            font-weight: 700;
+        }
+        
+        .subtitle {
+            font-size: 1.25rem;
+            margin-bottom: 2rem;
+            opacity: 0.9;
+        }
+        
+        .demo-note {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 1.5rem;
+            border-radius: 12px;
+            margin: 2rem 0;
+            backdrop-filter: blur(10px);
+        }
+        
+        .buttons {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin: 2rem 0;
+        }
+        
+        .btn {
+            padding: 12px 24px;
+            background: rgba(255, 255, 255, 0.2);
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 8px;
+            color: white;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(10px);
+        }
+        
+        .btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: translateY(-2px);
+        }
+        
+        .btn-primary {
+            background: rgba(102, 126, 234, 0.8);
+            border-color: rgba(102, 126, 234, 0.9);
+        }
+        
+        .features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin: 2rem 0;
+        }
+        
+        .feature {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 1rem;
+            border-radius: 8px;
+            backdrop-filter: blur(10px);
+        }
+        
+        .feature h3 {
+            margin-bottom: 0.5rem;
+            color: #ffd700;
+        }
+        
+        .github-link {
+            margin-top: 2rem;
+            font-size: 0.9rem;
+            opacity: 0.8;
+        }
+        
+        .github-link a {
+            color: #ffd700;
+            text-decoration: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 AutoAgentHire</h1>
+        <p class="subtitle">AI-Powered LinkedIn Job Automation</p>
+        
+        <div class="demo-note">
+            <h3>🌐 Serverless Demo Version</h3>
+            <p>This is a demonstration deployment of AutoAgentHire running on Vercel. Browser automation features are available in the full local installation.</p>
+        </div>
+        
+        <div class="buttons">
+            <a href="/docs" class="btn btn-primary">📚 API Documentation</a>
+            <a href="/api/demo" class="btn">🚀 Demo Endpoint</a>
+            <a href="/health" class="btn">🔍 Health Check</a>
+        </div>
+        
+        <div class="features">
+            <div class="feature">
+                <h3>🧠 AI Analysis</h3>
+                <p>Gemini AI powered job compatibility scoring</p>
+            </div>
+            <div class="feature">
+                <h3>📄 Resume Processing</h3>
+                <p>PDF resume upload and analysis</p>
+            </div>
+            <div class="feature">
+                <h3>🎯 Job Matching</h3>
+                <p>Intelligent job recommendation system</p>
+            </div>
+            <div class="feature">
+                <h3>⚙️ Preferences</h3>
+                <p>Detailed job search configuration</p>
+            </div>
+        </div>
+        
+        <div class="demo-note">
+            <h3>🔧 Full Features Available Locally</h3>
+            <p>For complete LinkedIn automation with browser control and automatic applications, deploy the full version locally.</p>
+            <ul style="text-align: left; margin-top: 1rem;">
+                <li>✅ Real LinkedIn job searching</li>
+                <li>✅ Automatic job applications</li>
+                <li>✅ Browser automation with Playwright</li>
+                <li>✅ Beautiful Streamlit UI</li>
+                <li>✅ Extended timeout handling</li>
+            </ul>
+        </div>
+        
+        <div class="github-link">
+            <p>🔗 <a href="https://github.com/Sathwik11-hub/LinkedIn-Job-Automation-with-AI" target="_blank">View on GitHub</a> for full installation instructions</p>
+        </div>
+    </div>
+</body>
+</html>

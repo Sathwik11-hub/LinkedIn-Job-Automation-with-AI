@@ -1,0 +1,89 @@
+{
+  "version": 2,
+  "name": "autoagenthire",
+  "builds": [
+    {
+      "src": "vercel_app.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxLambdaSize": "50mb",
+        "runtime": "python3.11"
+      }
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "vercel_app.py"
+    },
+    {
+      "src": "/health",
+      "dest": "vercel_app.py"
+    },
+    {
+      "src": "/docs",
+      "dest": "vercel_app.py"
+    },
+    {
+      "src": "/openapi.json",
+      "dest": "vercel_app.py"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "vercel_app.py"
+    }
+  ],
+  "env": {
+    "APP_NAME": "AutoAgentHire",
+    "APP_ENV": "production",
+    "DEBUG": "False",
+    "LOG_LEVEL": "INFO",
+    "API_HOST": "0.0.0.0",
+    "API_PORT": "8000",
+    "DATABASE_URL": "sqlite+aiosqlite:///./autoagenthire.db",
+    "SYNC_DATABASE_URL": "sqlite:///./autoagenthire.db"
+  },
+  "functions": {
+    "vercel_app.py": {
+      "maxDuration": 300,
+      "memory": 1024,
+      "runtime": "python3.11"
+    }
+  },
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        {
+          "key": "Access-Control-Allow-Origin",
+          "value": "*"
+        },
+        {
+          "key": "Access-Control-Allow-Methods",
+          "value": "GET, POST, PUT, DELETE, OPTIONS"
+        },
+        {
+          "key": "Access-Control-Allow-Headers",
+          "value": "Content-Type, Authorization"
+        }
+      ]
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/$1"
+    }
+  ],
+  "redirects": [
+    {
+      "source": "/",
+      "destination": "/docs",
+      "permanent": false
+    }
+  ],
+  "regions": ["iad1"],
+  "github": {
+    "silent": true
+  }
+}
