@@ -39,10 +39,10 @@ class AutoApplyAgent:
         if GENAI_AVAILABLE and os.getenv("GEMINI_API_KEY"):
             try:
                 # No need to call genai.configure; just ensure the API key is set in the environment
-                if hasattr(genai, "GenerativeModel"):
+                try:
                     self.gemini_model = genai.GenerativeModel("gemini-1.5-flash")
                     logger.info("✅ Gemini AI initialized")
-                else:
+                except AttributeError:
                     logger.warning("⚠️ GenerativeModel not found in google.generativeai")
                     self.gemini_model = None
             except Exception as e:
