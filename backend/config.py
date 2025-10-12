@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     PINECONE_INDEX_NAME: Optional[str] = None
     
     # OpenAI
-    OPENAI_API_KEY: str = "demo-key-replace-with-real-key"
+    OPENAI_API_KEY: str = Field(..., description="OpenAI API key (required, set via environment variable)")
     OPENAI_MODEL: str = "gpt-4-turbo-preview"
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
     OPENAI_MAX_TOKENS: int = 4000
