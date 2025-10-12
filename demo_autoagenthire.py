@@ -15,6 +15,13 @@ sys.path.insert(0, str(backend_path))
 # from auto_apply_agent import AutoApplyAgent
 
 class AutoApplyAgent:
+    """
+    MOCK/DEMO PLACEHOLDER IMPLEMENTATION.
+    This is NOT the actual AutoApplyAgent implementation.
+    This class is provided for demonstration purposes only.
+    Do NOT use this for real automation or production.
+    For the actual implementation, see the backend/auto_apply_agent.py file.
+    """
     def __init__(self):
         self.browser = None
 
