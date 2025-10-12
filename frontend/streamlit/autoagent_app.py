@@ -258,25 +258,30 @@ def get_agent_status():
 def run_automation(file, job_preferences):
     """Run the AutoAgent automation."""
     try:
-        files = {"file": (file.name, file.getvalue(), "application/pdf")}
+        # Handle case where no file is uploaded (Quick Start mode)
+        if file is not None:
+            files = {"file": (file.name, file.getvalue(), "application/pdf")}
+        else:
+            # For Quick Start mode, just send preferences without file
+            files = None
+        
         data = {
-            "keyword": job_preferences["keyword"],
-            "location": job_preferences["location"],
-            "max_jobs": job_preferences["max_jobs"],
-            "similarity_threshold": job_preferences["similarity_threshold"],
-            "experience_level": job_preferences["experience_level"],
-            "job_type": job_preferences["job_type"],
-            "salary_range": job_preferences["salary_range"],
-            "skills": job_preferences["skills"],
-            "auto_apply": job_preferences["auto_apply"]
+            "preferences": job_preferences
         }
         
-        response = requests.post(
-            AUTOAGENT_ENDPOINT,
-            files=files,
-            data=data,
-            timeout=300
-        )
+        if files:
+            response = requests.post(
+                AUTOAGENT_ENDPOINT,
+                files=files,
+                data=data,
+                timeout=300
+            )
+        else:
+            response = requests.post(
+                AUTOAGENT_ENDPOINT,
+                json=data,
+                timeout=300
+            )
         
         return response.json() if response.status_code == 200 else None
         

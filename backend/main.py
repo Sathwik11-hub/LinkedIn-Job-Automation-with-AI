@@ -205,7 +205,7 @@ async def trigger_autoagent(request_data: dict):
         
         # Extract user preferences
         preferences = request_data.get("preferences", {})
-        keywords = preferences.get("job_title", "software engineer")
+        keywords = preferences.get("job_title", "AI Engineer")
         location = preferences.get("location", "Remote")
         experience_level = preferences.get("experience_level", "mid")
         resume_path = preferences.get("resume_path", "data/resumes/default_resume.txt")
@@ -225,8 +225,7 @@ async def trigger_autoagent(request_data: dict):
         return {
             "status": "success",
             "message": "AutoAgent started successfully",
-            "job_search_results": result.get("jobs_found", []),
-            "applications_submitted": result.get("applications_submitted", 0),
+            "data": result,
             "execution_summary": result.get("execution_summary", {})
         }
         
@@ -236,51 +235,15 @@ async def trigger_autoagent(request_data: dict):
             "status": "error",
             "message": f"Failed to start AutoAgent: {str(e)}"
         }
-        
-        # Extract parameters
-        keyword = request_data.get("keyword", "Python Developer")
-        location = request_data.get("location", "Remote")
-        resume_text = request_data.get("resume_text", "")
-        max_applications = request_data.get("max_applications", 3)
-        headless = request_data.get("headless", True)
-        
-        # Validate required parameters
-        if not keyword:
-            return {
-                "status": "error",
-                "message": "Keyword is required for job search"
-            }
-        
-        # Run the automation agent
-        logger.info(f"🤖 Starting AutoAgentHire for keyword: {keyword}")
-        
-        result = await run_autoagent(
-            keyword=keyword,
-            location=location,
-            resume_path="",  # Provide an appropriate path or variable if available
-        )
-        
-        return {
-            "status": "success",
-            "message": "AutoAgentHire automation completed",
-            "data": result
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ AutoAgent trigger failed: {str(e)}")
-        return {
-            "status": "error",
-            "message": f"Failed to start AutoAgent: {str(e)}"
-        }
 
 
-# File upload and agent endpoints
+# File upload and agent endpoints  
 from fastapi import UploadFile, File, Form
 import aiofiles
 import tempfile
 
 
-@app.post("/api/run-agent")
+@app.post("/api/run-agent-with-file")
 async def run_agent_with_resume(
     file: UploadFile = File(...),
     keyword: str = Form("AI Engineer"),
@@ -290,12 +253,6 @@ async def run_agent_with_resume(
 ):
     """
     Run AutoAgent LinkedIn automation with resume upload.
-    
-    This endpoint handles:
-    - Resume file upload and text extraction
-    - LinkedIn login and job search
-    - AI-powered job matching and applications
-    - Comprehensive results reporting
     """
     try:
         # Validate file type
@@ -313,7 +270,7 @@ async def run_agent_with_resume(
         
         try:
             # Import and run the AutoAgent service
-            from backend.agents.auto_apply_agent import run_autoagent
+            from backend.agents.auto_apply_agent_clean import run_autoagent
             
             logger.info(f"🚀 Starting AutoAgent for keyword: '{keyword}' in location: '{location}'")
             
@@ -323,7 +280,8 @@ async def run_agent_with_resume(
                 location=location,
                 resume_path=temp_file_path,
                 max_jobs=max_jobs,
-                similarity_threshold=similarity_threshold
+                similarity_threshold=similarity_threshold,
+                auto_apply=True
             )
             
             # Check for errors in results
