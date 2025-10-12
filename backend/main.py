@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
 import uvicorn
+import os
 
 from backend.config import settings
 # from backend.api import routes
@@ -14,6 +15,8 @@ from backend.config import settings
 
 # Setup logger
 # logger = setup_logger(__name__)
+import logging
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -52,7 +55,7 @@ app = FastAPI(
 # CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=settings.get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -84,11 +87,206 @@ async def health_check():
     }
 
 
-# TODO: Include routers
-# app.include_router(routes.auth_router, prefix="/auth", tags=["Authentication"])
-# app.include_router(routes.jobs_router, prefix="/jobs", tags=["Jobs"])
-# app.include_router(routes.applications_router, prefix="/applications", tags=["Applications"])
-# app.include_router(routes.user_router, prefix="/users", tags=["Users"])
+@app.post("/agents/job-search")
+async def trigger_job_search_agent(request_data: dict):
+    """Trigger the job search agent workflow."""
+    try:
+        # Mock implementation - replace with actual agent orchestrator
+        keywords = request_data.get("keywords", "")
+        location = request_data.get("location", "")
+        experience_level = request_data.get("experience_level", "")
+        job_type = request_data.get("job_type", "")
+        max_results = request_data.get("max_results", 50)
+        
+        # TODO: Initialize and run the actual agent orchestrator
+        # orchestrator = AgentOrchestrator()
+        # results = await orchestrator.execute_job_search_workflow(
+        #     user_id="demo_user",
+        #     search_criteria=request_data
+        # )
+        
+        # Mock response for now
+        mock_jobs = [
+            {
+                "title": f"Senior {keywords} Developer",
+                "company": "TechCorp Inc.",
+                "location": location or "Remote",
+                "job_type": job_type or "Full-time",
+                "description": f"We are looking for an experienced {keywords} developer to join our team...",
+                "match_score": 85,
+                "url": "https://example.com/job1"
+            },
+            {
+                "title": f"{keywords} Engineer",
+                "company": "StartupXYZ",
+                "location": location or "San Francisco, CA",
+                "job_type": job_type or "Full-time",
+                "description": f"Join our innovative team as a {keywords} engineer working on cutting-edge projects...",
+                "match_score": 78,
+                "url": "https://example.com/job2"
+            }
+        ]
+        
+        return {
+            "status": "success",
+            "message": f"Found {len(mock_jobs)} job opportunities",
+            "jobs": mock_jobs,
+            "search_criteria": request_data
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Job search failed: {str(e)}",
+            "jobs": []
+        }
+
+
+@app.post("/api/agent/run")
+async def run_auto_apply_agent(request_data: dict):
+    """Run the AutoAgentHire browser automation agent."""
+    try:
+        from backend.agents.auto_apply_agent import run_autoagent
+        
+        # Extract parameters
+        keyword = request_data.get("keyword", "Python Developer")
+        location = request_data.get("location", "Remote")
+        resume_text = request_data.get("resume_text", "")
+        max_applications = request_data.get("max_applications", 3)
+        headless = request_data.get("headless", True)
+        
+        # Validate required parameters
+        if not keyword:
+            return {
+                "status": "error",
+                "message": "Keyword is required for job search"
+            }
+        
+        # Run the automation agent
+        logger.info(f"🤖 Starting AutoAgentHire for keyword: {keyword}")
+        
+        result = await run_autoagent(
+            keyword=keyword,
+            location=location,
+            resume_path="",  # Provide an appropriate path or variable if available
+        )
+        
+        return {
+            "status": "success",
+            "message": "AutoAgentHire automation completed",
+            "data": result
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ AutoAgentHire error: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Automation failed: {str(e)}"
+        }
+
+
+@app.get("/api/agent/status")
+async def get_agent_status():
+    """Get the current status of automation agents."""
+    return {
+        "status": "operational",
+        "agents": {
+            "job_search": "available",
+            "auto_apply": "available",
+            "gemini_ai": "configured" if os.getenv("GEMINI_API_KEY") else "not_configured",
+            "linkedin": "configured" if os.getenv("LINKEDIN_EMAIL") else "not_configured"
+        },
+        "features": [
+            "Intelligent job matching",
+            "Automated applications", 
+            "AI-powered decision making",
+            "Resume analysis"
+        ]
+    }
+
+
+# File upload and agent endpoints
+from fastapi import UploadFile, File, Form
+import aiofiles
+import tempfile
+
+
+@app.post("/api/run-agent")
+async def run_agent_with_resume(
+    file: UploadFile = File(...),
+    keyword: str = Form("AI Engineer"),
+    location: str = Form("Remote"),
+    max_jobs: int = Form(10),
+    similarity_threshold: float = Form(0.5)
+):
+    """
+    Run AutoAgent LinkedIn automation with resume upload.
+    
+    This endpoint handles:
+    - Resume file upload and text extraction
+    - LinkedIn login and job search
+    - AI-powered job matching and applications
+    - Comprehensive results reporting
+    """
+    try:
+        # Validate file type
+        if not file.filename or not file.filename.lower().endswith('.pdf'):
+            return {
+                "status": "error",
+                "message": "Only PDF files are supported for resume upload"
+            }
+        
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        try:
+            # Import and run the AutoAgent service
+            from backend.agents.auto_apply_agent import run_autoagent
+            
+            logger.info(f"🚀 Starting AutoAgent for keyword: '{keyword}' in location: '{location}'")
+            
+            # Run the automation
+            results = await run_autoagent(
+                keyword=keyword,
+                location=location,
+                resume_path=temp_file_path,
+                max_jobs=max_jobs,
+                similarity_threshold=similarity_threshold
+            )
+            
+            # Check for errors in results
+            if "error" in results:
+                return {
+                    "status": "error",
+                    "message": results["error"]
+                }
+            
+            return {
+                "status": "success",
+                "message": "AutoAgent automation completed successfully",
+                "data": results
+            }
+            
+        finally:
+            # Clean up temporary file
+            import os
+            if os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+    
+    except Exception as e:
+        logger.error(f"❌ Run Agent error: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Automation failed: {str(e)}"
+        }
+
+
+# Include routers
+from backend.routes.agent import router as agent_router
+app.include_router(agent_router, tags=["AutoAgent"])
 
 
 if __name__ == "__main__":
