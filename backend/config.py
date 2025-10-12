@@ -3,7 +3,7 @@ Configuration management using Pydantic Settings.
 Loads environment variables and provides type-safe configuration.
 """
 from typing import List, Optional
-from pydantic import Field, validator
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -22,13 +22,13 @@ class Settings(BaseSettings):
     API_RELOAD: bool = True
     
     # Security
-    SECRET_KEY: str
+    SECRET_KEY: str = "default-secret-key-change-in-production"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     
     # Database
-    DATABASE_URL: str
+    DATABASE_URL: str = "sqlite:///./autoagenthire.db"  # Default to SQLite for demo
     SYNC_DATABASE_URL: Optional[str] = None
     
     # Redis
@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     PINECONE_INDEX_NAME: Optional[str] = None
     
     # OpenAI
-    OPENAI_API_KEY: str
+    OPENAI_API_KEY: str = "demo-key-replace-with-real-key"
     OPENAI_MODEL: str = "gpt-4-turbo-preview"
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
     OPENAI_MAX_TOKENS: int = 4000
@@ -114,21 +114,24 @@ class Settings(BaseSettings):
     # CORS
     CORS_ORIGINS: str = "http://localhost:3000,http://localhost:8501"
     
-    @validator("CORS_ORIGINS", pre=True)
-    def parse_cors_origins(cls, v):
-        if isinstance(v, str):
-            return [origin.strip() for origin in v.split(",")]
-        return v
+    def get_cors_origins(self) -> List[str]:
+        """Parse CORS origins from string."""
+        return [origin.strip() for origin in self.CORS_ORIGINS.split(",")]
     
     # File Upload
     MAX_UPLOAD_SIZE_MB: int = 10
     ALLOWED_RESUME_EXTENSIONS: str = "pdf,docx,txt"
     
-    @validator("ALLOWED_RESUME_EXTENSIONS", pre=True)
-    def parse_extensions(cls, v):
-        if isinstance(v, str):
-            return [ext.strip() for ext in v.split(",")]
-        return v
+    def get_allowed_extensions(self) -> List[str]:
+        """Parse allowed extensions from string."""
+        return [ext.strip() for ext in self.ALLOWED_RESUME_EXTENSIONS.split(",")]
+    
+    # LinkedIn Automation
+    LINKEDIN_EMAIL: Optional[str] = None
+    LINKEDIN_PASSWORD: Optional[str] = None
+    
+    # Alternative LLM: Local Llama
+    LLAMA_MODEL_PATH: Optional[str] = None
     
     # Logging
     LOG_FILE_PATH: str = "data/logs/app.log"
@@ -139,6 +142,7 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         case_sensitive = True
+        extra = "allow"  # Allow extra fields from .env
 
 
 # Global settings instance
