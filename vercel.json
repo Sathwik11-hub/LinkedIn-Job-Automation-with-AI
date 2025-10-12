@@ -78,7 +78,7 @@
   "redirects": [
     {
       "source": "/",
-      "destination": "/docs",
+      "destination": "/home",
       "permanent": false
     }
   ],
