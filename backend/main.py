@@ -17,6 +17,42 @@ from backend.config import settings
 # logger = setup_logger(__name__)
 import logging
 logger = logging.getLogger(__name__)
+import uuid
+import asyncio
+import time
+from typing import Dict, Any
+
+# In-memory job registry for background tasks
+JOBS: Dict[str, Dict[str, Any]] = {}
+
+
+async def _run_agent_background(job_id: str, kwargs: Dict[str, Any]):
+    """Helper to run the AutoAgent in background and update JOBS registry."""
+    JOBS[job_id]["status"] = "running"
+    JOBS[job_id]["started_at"] = time.time()
+    try:
+        from backend.agents.auto_apply_agent_clean import run_autoagent
+
+        result = await run_autoagent(**kwargs)
+
+        JOBS[job_id]["status"] = "completed"
+        JOBS[job_id]["finished_at"] = time.time()
+        JOBS[job_id]["result"] = result
+    except Exception as e:
+        logger.error(f"Background job {job_id} failed: {e}")
+        JOBS[job_id]["status"] = "failed"
+        JOBS[job_id]["finished_at"] = time.time()
+        JOBS[job_id]["error"] = str(e)
+    finally:
+        # Clean up any uploaded temp file referenced by the job
+        try:
+            file_path = JOBS[job_id].get("file")
+            if file_path:
+                import os
+                if os.path.exists(file_path):
+                    os.unlink(file_path)
+        except Exception:
+            pass
 
 
 @asynccontextmanager
@@ -184,11 +220,21 @@ async def run_auto_apply_agent(request_data: dict):
 async def get_agent_status():
     """Get the current status of the AutoAgent."""
     try:
+        # Provide job registry overview
+        running = [j for j, v in JOBS.items() if v["status"] == "running"]
+        completed = [j for j, v in JOBS.items() if v["status"] in ("completed", "failed")]
+        last_run = None
+        if completed:
+            last_id = completed[-1]
+            last_run = JOBS[last_id].get("finished_at")
+
         return {
             "status": "ready",
-            "message": "AutoAgent is ready to run",
-            "last_run": None,
-            "applications_submitted": 0
+            "message": "AutoAgent is operational",
+            "running_jobs": len(running),
+            "completed_jobs": len(completed),
+            "last_run": last_run,
+            "jobs": {j: {"status": JOBS[j]["status"], "started_at": JOBS[j].get("started_at") } for j in list(JOBS.keys())}
         }
     except Exception as e:
         return {
@@ -201,32 +247,32 @@ async def get_agent_status():
 async def trigger_autoagent(request_data: dict):
     """Trigger the AutoAgent with job search and auto-apply."""
     try:
-        from backend.agents.auto_apply_agent_clean import run_autoagent
-        
-        # Extract user preferences
+        # Extract user preferences and enqueue background job
         preferences = request_data.get("preferences", {})
         keywords = preferences.get("job_title", "AI Engineer")
         location = preferences.get("location", "Remote")
         experience_level = preferences.get("experience_level", "mid")
         resume_path = preferences.get("resume_path", "data/resumes/default_resume.txt")
-        
-        logger.info(f"🚀 Triggering AutoAgent with preferences: {preferences}")
-        
-        # Start the automated job search and application process
-        result = await run_autoagent(
-            keyword=keywords,
-            location=location,
-            resume_path=resume_path,
-            experience_level=experience_level,
-            max_jobs=5,
-            auto_apply=True
-        )
-        
+
+        job_id = str(uuid.uuid4())
+        JOBS[job_id] = {"status": "queued", "created_at": time.time(), "prefs": preferences}
+
+        kwargs = {
+            "keyword": keywords,
+            "location": location,
+            "resume_path": resume_path,
+            "experience_level": experience_level,
+            "max_jobs": 5,
+            "auto_apply": True
+        }
+
+        # Schedule background task
+        asyncio.create_task(_run_agent_background(job_id, kwargs))
+
         return {
             "status": "success",
-            "message": "AutoAgent started successfully",
-            "data": result,
-            "execution_summary": result.get("execution_summary", {})
+            "message": "AutoAgent job queued",
+            "job_id": job_id
         }
         
     except Exception as e:
@@ -269,39 +315,31 @@ async def run_agent_with_resume(
             temp_file_path = temp_file.name
         
         try:
-            # Import and run the AutoAgent service
-            from backend.agents.auto_apply_agent_clean import run_autoagent
-            
-            logger.info(f"🚀 Starting AutoAgent for keyword: '{keyword}' in location: '{location}'")
-            
-            # Run the automation
-            results = await run_autoagent(
-                keyword=keyword,
-                location=location,
-                resume_path=temp_file_path,
-                max_jobs=max_jobs,
-                similarity_threshold=similarity_threshold,
-                auto_apply=True
-            )
-            
-            # Check for errors in results
-            if "error" in results:
-                return {
-                    "status": "error",
-                    "message": results["error"]
-                }
-            
+            # Enqueue a background job for the uploaded resume
+            job_id = str(uuid.uuid4())
+            JOBS[job_id] = {"status": "queued", "created_at": time.time(), "file": temp_file_path}
+
+            kwargs = {
+                "keyword": keyword,
+                "location": location,
+                "resume_path": temp_file_path,
+                "max_jobs": max_jobs,
+                "similarity_threshold": similarity_threshold,
+                "auto_apply": True
+            }
+
+            asyncio.create_task(_run_agent_background(job_id, kwargs))
+
             return {
                 "status": "success",
-                "message": "AutoAgent automation completed successfully",
-                "data": results
+                "message": "AutoAgent job queued for uploaded resume",
+                "job_id": job_id
             }
             
         finally:
-            # Clean up temporary file
-            import os
-            if os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
+            # Do NOT delete temp_file_path here - background job will clean up after completion
+            # This avoids deleting the file while the background task is still using it.
+            pass
     
     except Exception as e:
         logger.error(f"❌ Run Agent error: {str(e)}")

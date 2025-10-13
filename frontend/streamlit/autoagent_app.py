@@ -235,6 +235,7 @@ BACKEND_URL = "http://127.0.0.1:8000"
 HEALTH_ENDPOINT = f"{BACKEND_URL}/health"
 JOB_SEARCH_ENDPOINT = f"{BACKEND_URL}/agents/job-search"
 AUTOAGENT_ENDPOINT = f"{BACKEND_URL}/api/run-agent"
+AUTOAGENT_FILE_ENDPOINT = f"{BACKEND_URL}/api/run-agent-with-file"
 AGENT_STATUS_ENDPOINT = f"{BACKEND_URL}/api/agent/status"
 
 def check_api_health():
@@ -260,23 +261,24 @@ def run_automation(file, job_preferences):
     try:
         # Handle case where no file is uploaded (Quick Start mode)
         if file is not None:
+            # When uploading a resume, use the file endpoint and send expected form fields
             files = {"file": (file.name, file.getvalue(), "application/pdf")}
-        else:
-            # For Quick Start mode, just send preferences without file
-            files = None
-        
-        data = {
-            "preferences": job_preferences
-        }
-        
-        if files:
+            form_data = {
+                "keyword": job_preferences.get("keyword", job_preferences.get("job_title", "AI Engineer")),
+                "location": job_preferences.get("location", "Remote"),
+                "max_jobs": job_preferences.get("max_jobs", 10),
+                "similarity_threshold": job_preferences.get("similarity_threshold", 0.6)
+            }
+
             response = requests.post(
-                AUTOAGENT_ENDPOINT,
+                AUTOAGENT_FILE_ENDPOINT,
                 files=files,
-                data=data,
+                data=form_data,
                 timeout=300
             )
         else:
+            # For Quick Start mode, just send preferences without file
+            data = {"preferences": job_preferences}
             response = requests.post(
                 AUTOAGENT_ENDPOINT,
                 json=data,
@@ -359,7 +361,11 @@ uvicorn backend.main:app --reload --host 127.0.0.1 --port 50501
             result = run_automation(None, quick_preferences)
             
             if result and result.get("status") == "success":
-                st.success("✅ AutoAgent completed successfully!")
+                job_id = result.get("job_id")
+                st.success("✅ AutoAgent job queued successfully!")
+                if job_id:
+                    st.info(f"Job queued with id: {job_id}. Poll /api/agent/status to track progress.")
+            
                 
                 # Show basic results
                 if "execution_summary" in result:
@@ -570,7 +576,10 @@ uvicorn backend.main:app --reload --host 127.0.0.1 --port 50501
             status_text.empty()
             
             if result and result.get("status") == "success":
-                st.success("✅ Automation completed successfully!")
+                job_id = result.get("job_id")
+                st.success("✅ AutoAgent job queued successfully!")
+                if job_id:
+                    st.info(f"Job queued with id: {job_id}. Poll /api/agent/status to track progress.")
                 
                 data = result.get("data", {})
                 

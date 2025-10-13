@@ -91,12 +91,26 @@ alembic upgrade head
 
 Backend:
 ```bash
-uvicorn backend.main:app --reload
+uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Streamlit Frontend:
+**Frontend Options:**
+
+Option A - Streamlit (Simple Dashboard):
 ```bash
-streamlit run frontend/streamlit/app.py
+streamlit run frontend/streamlit/autoagent_app.py --server.port 8501
+```
+
+Option B - React (Modern UI):
+```bash
+cd frontend/react
+npm install
+npm run dev
+```
+
+Or use the convenience scripts:
+```bash
+./start_react_frontend.sh
 ```
 
 React Frontend (optional):
@@ -130,6 +144,30 @@ Trigger the AI agents to:
 - Customize cover letters
 - Auto-fill application forms
 - Track application status
+
+## 🎨 Frontend Options
+
+AutoAgentHire offers two frontend interfaces to suit different preferences:
+
+### Streamlit Dashboard (Quick & Simple)
+- **Port**: http://localhost:8501
+- **Features**: Simple dashboard for quick job automation
+- **Best for**: Users who want a straightforward interface
+- **Startup**: `streamlit run frontend/streamlit/autoagent_app.py`
+
+### React App (Modern & Interactive)
+- **Port**: http://localhost:3000
+- **Features**: Modern glassmorphism UI with animations
+- **Best for**: Users who prefer a polished, interactive experience
+- **Technologies**: Next.js, Tailwind CSS, Lucide Icons
+- **Startup**: `./start_react_frontend.sh` or `cd frontend/react && npm run dev`
+
+**Key React Features:**
+- 🎨 Beautiful glassmorphism design
+- 📱 Fully responsive layout
+- ⚡ Real-time progress tracking
+- 🎯 Interactive job results
+- 🚀 Smooth animations and transitions
 
 ## 🤖 AI Agents
 
