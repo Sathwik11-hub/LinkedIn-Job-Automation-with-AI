@@ -2,14 +2,15 @@
 Main FastAPI application entry point.
 Initializes the application, middleware, and routes.
 """
-from fastapi import FastAPI
+from typing import Optional, Dict, Any
+from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
 import uvicorn
 
 from backend.config import settings
-# from backend.api import routes
+from backend.routes.api_routes import router as api_router
 # from backend.utils.logger import setup_logger
 
 # Setup logger
@@ -52,7 +53,7 @@ app = FastAPI(
 # CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=settings.cors_origins_list if hasattr(settings, 'cors_origins_list') else settings.CORS_ORIGINS.split(','),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -60,6 +61,9 @@ app.add_middleware(
 
 # Gzip Middleware for response compression
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Include routers
+app.include_router(api_router)
 
 
 # Health check endpoint
@@ -83,6 +87,41 @@ async def health_check():
         "vector_db": "connected",  # TODO: Check vector DB connection
     }
 
+
+# Simple API to run the automation agent (mocked for local dev)
+@app.post("/api/run-agent")
+async def run_agent(background_tasks: BackgroundTasks, payload: Optional[Dict[str, Any]] = None):
+    """Trigger the agent orchestrator to search and apply for jobs.
+
+    Accepts a JSON payload with search criteria. Example:
+      {"keywords": "AI Engineer", "location": "Remote", "linkedin_email": "...", "linkedin_password": "...", "submit": false}
+    """
+    from backend.agents.orchestrator import AgentOrchestrator
+
+    data = payload or {}
+    orchestrator = AgentOrchestrator()
+
+    async def _run_task(criteria: dict):
+        await orchestrator.execute_job_search_workflow(user_id="local_user", search_criteria=criteria)
+
+    background_tasks.add_task(_run_task, data)
+    return {"status": "started", "message": "Agent started in background"}
+
+
+@app.get("/api/agent/status")
+async def agent_status():
+    """Return status of last agent run."""
+    from backend.agents.state import get_status
+
+    return get_status()
+
+
+# Include AutoAgentHire routes
+try:
+    from backend.api.autoagenthire import register_autoagenthire_routes
+    register_autoagenthire_routes(app)
+except Exception as e:
+    print(f"⚠️  Could not load AutoAgentHire routes: {e}")
 
 # TODO: Include routers
 # app.include_router(routes.auth_router, prefix="/auth", tags=["Authentication"])

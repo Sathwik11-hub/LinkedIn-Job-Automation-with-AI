@@ -110,25 +110,33 @@ class Settings(BaseSettings):
     # Frontend
     STREAMLIT_PORT: int = 8501
     REACT_APP_API_URL: str = "http://localhost:8000"
-    
-    # CORS
+
+    # CORS - stored as comma-separated string in .env, parsed to list
     CORS_ORIGINS: str = "http://localhost:3000,http://localhost:8501"
     
-    @validator("CORS_ORIGINS", pre=True)
-    def parse_cors_origins(cls, v):
-        if isinstance(v, str):
-            return [origin.strip() for origin in v.split(",")]
-        return v
-    
+    @property
+    def cors_origins_list(self) -> List[str]:
+        """Parse CORS_ORIGINS string to list."""
+        if isinstance(self.CORS_ORIGINS, list):
+            return self.CORS_ORIGINS
+        return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+
     # File Upload
     MAX_UPLOAD_SIZE_MB: int = 10
     ALLOWED_RESUME_EXTENSIONS: str = "pdf,docx,txt"
     
-    @validator("ALLOWED_RESUME_EXTENSIONS", pre=True)
-    def parse_extensions(cls, v):
-        if isinstance(v, str):
-            return [ext.strip() for ext in v.split(",")]
-        return v
+    @property
+    def allowed_extensions_list(self) -> List[str]:
+        """Parse ALLOWED_RESUME_EXTENSIONS string to list."""
+        if isinstance(self.ALLOWED_RESUME_EXTENSIONS, list):
+            return self.ALLOWED_RESUME_EXTENSIONS
+        return [ext.strip() for ext in self.ALLOWED_RESUME_EXTENSIONS.split(",") if ext.strip()]
+
+    # Optional fields present in .env but not strictly required
+    LLAMA_MODEL_PATH: Optional[str] = None
+    LINKEDIN_EMAIL: Optional[str] = None
+    LINKEDIN_PASSWORD: Optional[str] = None
+    GEMINI_API_KEY: Optional[str] = None
     
     # Logging
     LOG_FILE_PATH: str = "data/logs/app.log"
@@ -139,7 +147,30 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         case_sensitive = True
+        # Ignore extra environment variables that are not declared on the model
+        extra = "ignore"
 
 
 # Global settings instance
-settings = Settings()
+try:
+    settings = Settings()
+except Exception as e:
+    # If environment parsing/validation fails (common during local dev),
+    # fall back to a minimal, safe Settings object constructed from
+    # environment variables or sensible defaults so the app can start.
+    import os
+    print("Warning: Settings validation failed, falling back to minimal defaults:", e)
+    settings = Settings.construct(
+        APP_NAME=os.environ.get("APP_NAME", "AutoAgentHire"),
+        APP_ENV=os.environ.get("APP_ENV", "development"),
+        DEBUG=os.environ.get("DEBUG", "True") in ["True", "true", "1"],
+        LOG_LEVEL=os.environ.get("LOG_LEVEL", "INFO"),
+        API_HOST=os.environ.get("API_HOST", "0.0.0.0"),
+        API_PORT=int(os.environ.get("API_PORT", 8000)),
+        API_RELOAD=False,
+        SECRET_KEY=os.environ.get("SECRET_KEY", "dev-secret"),
+        DATABASE_URL=os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./autoagenthire.db"),
+        OPENAI_API_KEY=os.environ.get("OPENAI_API_KEY", "test-key"),
+        CORS_ORIGINS=os.environ.get("CORS_ORIGINS", "http://localhost:3000,http://localhost:8501"),
+        ALLOWED_RESUME_EXTENSIONS=os.environ.get("ALLOWED_RESUME_EXTENSIONS", "pdf,docx,txt"),
+    )

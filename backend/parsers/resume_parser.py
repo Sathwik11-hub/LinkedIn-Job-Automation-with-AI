@@ -4,8 +4,24 @@ Supports PDF, DOCX, and TXT formats.
 """
 from typing import Dict, Any, Optional
 from pathlib import Path
-# import PyPDF2
-# from docx import Document
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Try to import optional dependencies
+try:
+    import PyPDF2
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+    logger.warning("PyPDF2 not installed - PDF parsing disabled")
+
+try:
+    from docx import Document
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+    logger.warning("python-docx not installed - DOCX parsing disabled")
 
 
 class ResumeParser:
@@ -52,13 +68,37 @@ class ResumeParser:
     
     def _extract_from_pdf(self, file_path: str) -> str:
         """Extract text from PDF file."""
-        # TODO: Implement PDF extraction using PyPDF2
-        return ""
+        if not PDF_AVAILABLE:
+            return "PDF parsing not available - PyPDF2 not installed"
+        
+        try:
+            text = []
+            with open(file_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                for page in pdf_reader.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text.append(page_text)
+            return '\n'.join(text)
+        except Exception as e:
+            logger.error(f"Error extracting PDF: {e}")
+            return ""
     
     def _extract_from_docx(self, file_path: str) -> str:
         """Extract text from DOCX file."""
-        # TODO: Implement DOCX extraction using python-docx
-        return ""
+        if not DOCX_AVAILABLE:
+            return "DOCX parsing not available - python-docx not installed"
+        
+        try:
+            doc = Document(file_path)
+            text = []
+            for paragraph in doc.paragraphs:
+                if paragraph.text.strip():
+                    text.append(paragraph.text)
+            return '\n'.join(text)
+        except Exception as e:
+            logger.error(f"Error extracting DOCX: {e}")
+            return ""
     
     def _extract_from_txt(self, file_path: str) -> str:
         """Extract text from TXT file."""
@@ -90,3 +130,19 @@ class ResumeParser:
             "certifications": [],
             "raw_text": text
         }
+
+
+# Helper function for backward compatibility
+def extract_resume_text(file_path: str) -> str:
+    """
+    Extract raw text from a resume file.
+    
+    Args:
+        file_path: Path to the resume file
+        
+    Returns:
+        Extracted text from the resume
+    """
+    parser = ResumeParser()
+    result = parser.parse(file_path)
+    return result.get("raw_text", "")
