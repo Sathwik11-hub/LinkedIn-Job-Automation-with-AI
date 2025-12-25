@@ -4,11 +4,11 @@ uvicorn[standard]==0.27.0
 python-multipart==0.0.6
 websockets==12.0
 
-# AI Agents Framework (Optional - commented out due to Python 3.13 compatibility)
-# crewai==0.1.27
-# langchain==0.1.0
-# langchain-openai==0.0.2
-# langgraph==0.0.20
+AI Agents Framework (Optional - commented out due to Python 3.13 compatibility)
+crewai==0.1.27
+langchain==0.1.0
+langchain-openai==0.0.2
+langgraph==0.0.20
 
 # LLM Integration
 openai==1.10.0

@@ -291,6 +291,8 @@ class LinkedInAutoApply:
     
     async def human_type(self, selector: str, text: str):
         """Type text with human-like delays."""
+        if not self.page:
+            return
         await self.page.click(selector)
         await self.human_delay(0.5, 1.0)
         
@@ -309,6 +311,10 @@ class LinkedInAutoApply:
         """
         logger.info("🔐 Logging into LinkedIn...")
         
+        if not self.page:
+            logger.error("❌ Browser page not initialized")
+            return False
+        
         try:
             # Navigate to LinkedIn login page
             await self.page.goto('https://www.linkedin.com/login', wait_until='domcontentloaded')
@@ -319,12 +325,14 @@ class LinkedInAutoApply:
             
             # Enter email with human-like typing
             logger.info("📧 Entering email...")
-            await self.human_type('#username', self.email)
+            if self.email:
+                await self.human_type('#username', self.email)
             await self.human_delay(0.5, 1.0)
             
             # Enter password
             logger.info("🔑 Entering password...")
-            await self.human_type('#password', self.password)
+            if self.password:
+                await self.human_type('#password', self.password)
             await self.human_delay(0.5, 1.0)
             
             # Random mouse movement
@@ -390,6 +398,10 @@ class LinkedInAutoApply:
         """
         logger.info(f"🔍 Searching jobs: {keywords} in {location}")
         
+        if not self.page:
+            logger.error("❌ Browser page not initialized")
+            return 0
+        
         try:
             # Navigate to jobs page
             await self.page.goto('https://www.linkedin.com/jobs/', wait_until='domcontentloaded')
@@ -440,6 +452,8 @@ class LinkedInAutoApply:
     
     async def _apply_easy_apply_filter(self):
         """Apply Easy Apply filter."""
+        if not self.page:
+            return
         try:
             # Click "Easy Apply" filter button
             easy_apply_button = 'button[aria-label*="Easy Apply filter"]'
@@ -453,6 +467,8 @@ class LinkedInAutoApply:
     
     async def _apply_experience_filter(self, experience_level: str):
         """Apply experience level filter."""
+        if not self.page:
+            return
         try:
             # Click "Experience Level" filter
             await self.page.click('button:has-text("Experience Level")')
@@ -471,6 +487,8 @@ class LinkedInAutoApply:
     
     async def _apply_job_type_filter(self, job_type: str):
         """Apply job type filter."""
+        if not self.page:
+            return
         try:
             # Click "Job Type" filter
             await self.page.click('button:has-text("Job Type")')
@@ -489,6 +507,8 @@ class LinkedInAutoApply:
     
     async def _count_jobs(self) -> int:
         """Count total jobs found."""
+        if not self.page:
+            return 0
         try:
             results_text = await self.page.text_content('.jobs-search-results-list__subtitle')
             if results_text:
@@ -515,6 +535,10 @@ class LinkedInAutoApply:
         logger.info(f"📄 Parsing job listings (max: {max_jobs})...")
         
         jobs = []
+        
+        if not self.page:
+            logger.error("❌ Browser page not initialized")
+            return jobs
         
         try:
             # Scroll to load more jobs
@@ -554,8 +578,13 @@ class LinkedInAutoApply:
     
     async def _scroll_job_list(self, target_count: int):
         """Scroll job list to load more jobs."""
+        if not self.page:
+            return
         try:
             job_list = await self.page.query_selector('.jobs-search-results-list')
+            
+            if not job_list:
+                return
             
             for _ in range(min(target_count // 10, 10)):  # Scroll up to 10 times
                 await job_list.evaluate('el => el.scrollTop = el.scrollHeight')
@@ -566,36 +595,38 @@ class LinkedInAutoApply:
     
     async def _extract_job_details(self, card) -> Optional[JobListing]:
         """Extract details from a job card."""
+        if not self.page:
+            return None
         try:
             # Extract job ID
             job_id = await card.get_attribute('data-job-id') or f"job_{random.randint(10000, 99999)}"
             
             # Extract title
             title_elem = await self.page.query_selector('.job-details-jobs-unified-top-card__job-title')
-            title = await title_elem.text_content() if title_elem else "Unknown"
-            title = title.strip()
+            title_text = await title_elem.text_content() if title_elem else None
+            title = title_text.strip() if title_text else "Unknown"
             
             # Extract company
             company_elem = await self.page.query_selector('.job-details-jobs-unified-top-card__company-name')
-            company = await company_elem.text_content() if company_elem else "Unknown"
-            company = company.strip()
+            company_text = await company_elem.text_content() if company_elem else None
+            company = company_text.strip() if company_text else "Unknown"
             
             # Extract location
             location_elem = await self.page.query_selector('.job-details-jobs-unified-top-card__bullet')
-            location = await location_elem.text_content() if location_elem else "Unknown"
-            location = location.strip()
+            location_text = await location_elem.text_content() if location_elem else None
+            location = location_text.strip() if location_text else "Unknown"
             
             # Extract description
             description_elem = await self.page.query_selector('.jobs-description-content__text')
-            description = await description_elem.text_content() if description_elem else ""
-            description = description.strip()
+            description_text = await description_elem.text_content() if description_elem else None
+            description = description_text.strip() if description_text else ""
             
             # Extract salary if available
             salary = None
             salary_elems = await self.page.query_selector_all('.job-details-jobs-unified-top-card__job-insight')
             for elem in salary_elems:
                 text = await elem.text_content()
-                if '$' in text:
+                if text and '$' in text:
                     salary = text.strip()
                     break
             
@@ -733,6 +764,11 @@ class LinkedInAutoApply:
             timestamp=datetime.now().isoformat()
         )
         
+        if not self.page:
+            logger.error("❌ Browser page not initialized")
+            result.error_message = "Browser not initialized"
+            return result
+        
         try:
             # Navigate to job if not already there
             if self.page.url != job.apply_link:
@@ -779,6 +815,10 @@ class LinkedInAutoApply:
         """Fill out the Easy Apply application form."""
         logger.info("📋 Filling application form...")
         
+        if not self.page:
+            logger.error("❌ Browser page not initialized")
+            raise Exception("Browser not initialized")
+        
         try:
             # Wait for form modal
             await self.page.wait_for_selector('.jobs-easy-apply-content', timeout=5000)
@@ -821,6 +861,8 @@ class LinkedInAutoApply:
     
     async def _fill_visible_fields(self):
         """Fill visible form fields with sensible defaults."""
+        if not self.page:
+            return
         try:
             # Get all text inputs
             text_inputs = await self.page.query_selector_all('input[type="text"]:visible')
@@ -864,6 +906,8 @@ class LinkedInAutoApply:
     
     async def _add_cover_letter(self, cover_letter: str):
         """Add cover letter to application if field exists."""
+        if not self.page:
+            return
         try:
             # Look for cover letter textarea
             cover_letter_field = await self.page.query_selector('textarea[id*="coverLetter"]')
@@ -879,6 +923,8 @@ class LinkedInAutoApply:
     
     async def _submit_application(self):
         """Submit the application."""
+        if not self.page:
+            raise Exception("Browser not initialized")
         try:
             # Look for submit/review button
             submit_button = await self.page.query_selector('button[aria-label*="Submit application"]')
@@ -980,10 +1026,10 @@ class LinkedInAutoApply:
     async def _generate_cover_letter_gemini(self, job: JobListing) -> str:
         """Generate cover letter using Gemini API."""
         try:
-            import google.generativeai as genai
+            import google.generativeai as genai  # type: ignore
             
-            genai.configure(api_key=self.gemini_api_key)
-            model = genai.GenerativeModel('gemini-2.5-flash')  # Latest fast model
+            genai.configure(api_key=self.gemini_api_key)  # type: ignore
+            model = genai.GenerativeModel('gemini-2.5-flash')  # type: ignore # Latest fast model
             
             prompt = f"""
             Write a professional, concise cover letter for this job application:
@@ -1009,8 +1055,8 @@ class LinkedInAutoApply:
             - Do not include signature name
             """
             
-            response = model.generate_content(prompt)
-            cover_letter = response.text.strip() if response.text else ""
+            response = model.generate_content(prompt)  # type: ignore
+            cover_letter = response.text.strip() if response.text else ""  # type: ignore
             
             logger.info("✅ Cover letter generated with Gemini")
             return cover_letter
@@ -1141,17 +1187,17 @@ Best regards"""
             # Create email
             msg = MIMEMultipart('alternative')
             msg['Subject'] = f"LinkedIn Auto Apply Report - {datetime.now().strftime('%Y-%m-%d')}"
-            msg['From'] = email_from
-            msg['To'] = email_to
+            msg['From'] = email_from  # type: ignore
+            msg['To'] = email_to  # type: ignore
             
             # Create HTML body
             html = self._create_html_report(report)
             msg.attach(MIMEText(html, 'html'))
             
             # Send email
-            with smtplib.SMTP(smtp_server, smtp_port) as server:
+            with smtplib.SMTP(smtp_server, smtp_port) as server:  # type: ignore
                 server.starttls()
-                server.login(email_from, smtp_password)
+                server.login(email_from, smtp_password)  # type: ignore
                 server.send_message(msg)
             
             logger.info(f"✅ Report emailed to {email_to}")
