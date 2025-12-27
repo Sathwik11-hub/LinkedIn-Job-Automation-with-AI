@@ -18,24 +18,40 @@
 
 ## 🏗️ Architecture
 
+The project follows a modular, scalable architecture:
+
 ```
 AutoAgentHire/
-├── backend/          # FastAPI backend with AI agents
-├── frontend/         # Streamlit & React UI
-├── database/         # PostgreSQL schemas and migrations
-├── vector_db/        # ChromaDB for embeddings
-├── tests/           # Unit, integration, and e2e tests
-└── docs/            # Documentation
+├── backend/              # FastAPI backend with AI agents
+│   ├── agents/           # AI agent implementations
+│   ├── orchestration/    # Multi-agent coordination
+│   ├── services/         # Business logic layer
+│   ├── models/           # Domain models
+│   ├── api/              # API integrations
+│   ├── routes/           # FastAPI routes
+│   ├── middleware/       # Custom middleware
+│   └── database/         # Database models & schemas
+├── frontend/             # Streamlit & React UI
+├── tests/                # Unit, integration, and e2e tests
+├── data/                 # Data storage (logs, uploads, vector DB)
+├── deployment/           # Kubernetes & deployment configs
+├── alembic/              # Database migrations
+├── config/               # Configuration files
+└── docs/                 # Documentation
 ```
+
+For detailed structure, see [Project Structure Documentation](docs/PROJECT_STRUCTURE.md).
 
 ### Tech Stack
 
 **Backend:**
 - FastAPI (API framework)
 - CrewAI/LangGraph (Agent orchestration)
-- OpenAI GPT-4 (LLM)
+- OpenAI GPT-4, Anthropic Claude, Google Gemini (LLMs)
 - ChromaDB/Pinecone (Vector database)
 - PostgreSQL (Relational database)
+- Neo4j (Graph database - optional)
+- Redis (Caching)
 - Selenium/Playwright (Web automation)
 
 **Frontend:**
@@ -45,7 +61,13 @@ AutoAgentHire/
 **AI/ML:**
 - LangChain (LLM framework)
 - Sentence Transformers (Embeddings)
-- spaCy (NLP)
+- spaCy/NLTK (NLP)
+
+**DevOps:**
+- Docker & Docker Compose
+- Kubernetes
+- Alembic (Database migrations)
+- GitHub Actions (CI/CD)
 
 ## 🚀 Quick Start
 
@@ -83,20 +105,27 @@ cp .env.example .env
 
 5. **Initialize database**
 ```bash
-python scripts/setup_db.py
-alembic upgrade head
+make db-upgrade
+# Or manually: alembic upgrade head
 ```
 
-6. **Run the application**
+6. **Verify setup**
+```bash
+python scripts/verify_setup.py
+```
+
+7. **Run the application**
 
 Backend:
 ```bash
-uvicorn backend.main:app --reload
+make run-dev
+# Or: uvicorn backend.main:app --reload
 ```
 
 Streamlit Frontend:
 ```bash
-streamlit run frontend/streamlit/app.py
+make streamlit
+# Or: streamlit run frontend/streamlit/app.py
 ```
 
 React Frontend (optional):
@@ -104,6 +133,52 @@ React Frontend (optional):
 cd frontend/react
 npm install
 npm run dev
+```
+
+## 🛠️ Development Commands
+
+The project includes a comprehensive Makefile for common development tasks:
+
+```bash
+# Setup and Installation
+make install          # Install production dependencies
+make install-dev      # Install development dependencies
+make setup           # Initial project setup
+
+# Running the Application
+make run             # Run backend in development mode
+make run-dev         # Run with auto-reload and debug
+make streamlit       # Run Streamlit frontend
+
+# Database Management
+make db-migrate      # Create new migration (requires msg="description")
+make db-upgrade      # Apply migrations
+make db-downgrade    # Rollback migration
+make db-current      # Show current revision
+
+# Code Quality
+make format          # Format code with black and isort
+make lint            # Run flake8 linter
+make type-check      # Run mypy type checker
+make security-check  # Run bandit security scanner
+make quality         # Run all quality checks
+
+# Testing
+make test            # Run all tests
+make test-unit       # Run unit tests only
+make test-integration # Run integration tests
+make test-e2e        # Run end-to-end tests
+make test-cov        # Run with coverage report
+
+# Docker
+make docker-build    # Build Docker images
+make docker-up       # Start containers
+make docker-down     # Stop containers
+make docker-logs     # View logs
+
+# Utilities
+make clean           # Clean cache and temp files
+make help            # Show all available commands
 ```
 
 ## 📋 Usage
