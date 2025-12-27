@@ -1,0 +1,134 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autoagenthire-config
+data:
+  APP_NAME: "AutoAgentHire"
+  APP_ENV: "production"
+  LOG_LEVEL: "INFO"
+  API_HOST: "0.0.0.0"
+  API_PORT: "8000"
+  REDIS_URL: "redis://autoagenthire-redis:6379/0"
+  CHROMA_HOST: "autoagenthire-chromadb"
+  CHROMA_PORT: "8001"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: autoagenthire-secrets
+type: Opaque
+stringData:
+  database-url: "postgresql+asyncpg://user:password@autoagenthire-postgres:5432/autoagenthire"
+  openai-api-key: "your-openai-api-key"
+  secret-key: "your-secret-key-change-in-production"
+  encryption-key: "your-encryption-key"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autoagenthire-postgres
+  labels:
+    app: autoagenthire
+    component: database
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: autoagenthire
+      component: database
+  template:
+    metadata:
+      labels:
+        app: autoagenthire
+        component: database
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:14-alpine
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_DB
+          value: "autoagenthire"
+        - name: POSTGRES_USER
+          value: "user"
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: autoagenthire-secrets
+              key: database-password
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: autoagenthire-postgres
+  labels:
+    app: autoagenthire
+    component: database
+spec:
+  type: ClusterIP
+  ports:
+  - port: 5432
+    targetPort: 5432
+  selector:
+    app: autoagenthire
+    component: database
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autoagenthire-redis
+  labels:
+    app: autoagenthire
+    component: cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: autoagenthire
+      component: cache
+  template:
+    metadata:
+      labels:
+        app: autoagenthire
+        component: cache
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: autoagenthire-redis
+  labels:
+    app: autoagenthire
+    component: cache
+spec:
+  type: ClusterIP
+  ports:
+  - port: 6379
+    targetPort: 6379
+  selector:
+    app: autoagenthire
+    component: cache
