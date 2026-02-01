@@ -43,7 +43,7 @@ email-validator==2.1.0
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 PyJWT==2.8.0
-cryptography==42.0.0  # Updated for Fernet support
+cryptography==42.0.4  # Security patch: fixes NULL pointer dereference in pkcs12.serialize_key_and_certificates
 
 # Logging & Monitoring
 loguru==0.7.2
