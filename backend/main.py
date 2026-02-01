@@ -20,6 +20,7 @@ from backend.routes.ats_routes import router as ats_router
 from backend.routes.cover_letter_routes import router as cover_letter_router
 from backend.api.autoagenthire import router as autoagenthire_router
 from backend.routes.v2_routes import router as v2_router
+from backend.routes.auth_routes import router as auth_router  # NEW: Authentication routes
 from backend.database.connection import init_db
 # from backend.utils.logger import setup_logger
 
@@ -103,6 +104,7 @@ app.include_router(ats_router)
 app.include_router(cover_letter_router)
 app.include_router(autoagenthire_router)
 app.include_router(v2_router)  # V2 API for frontend
+app.include_router(auth_router)  # NEW: Authentication routes
 
 
 # Health check endpoint

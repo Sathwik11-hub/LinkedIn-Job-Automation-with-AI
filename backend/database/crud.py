@@ -569,3 +569,11 @@ class AnalyticsRepository:
             .order_by(desc(AnalyticsEvent.timestamp))\
             .limit(limit)\
             .all()
+
+# Backward Compatibility Helper Functions
+
+def get_user(db, user_id):
+    return UserRepository.get_by_id(db, user_id)
+
+def get_user_by_email(db, email):
+    return UserRepository.get_by_email(db, email)
