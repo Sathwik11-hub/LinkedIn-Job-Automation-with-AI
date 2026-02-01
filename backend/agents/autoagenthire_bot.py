@@ -2393,10 +2393,6 @@ Provide a professional 2-3 sentence answer:"""
                 print(f"   Expired entries: {cache_stats.get('expired_entries', 0)}")
             
             return report
-            print(f"✅ Applications Successful: {report['applications_successful']}")
-            print(f"⏱️  Duration: {duration} seconds")
-            
-            return report
             
         except Exception as e:
             print(f"\n❌ AUTOMATION FAILED: {str(e)}")
