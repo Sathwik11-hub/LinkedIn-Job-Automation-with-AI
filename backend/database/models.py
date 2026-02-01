@@ -122,8 +122,9 @@ class Credential(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    platform = Column(String(100), nullable=False)  # linkedin, indeed, etc.
-    encrypted_data = Column(Text, nullable=False)
+    service = Column(String(100), nullable=False)  # linkedin, gemini, github, etc.
+    username = Column(String(255))  # email or username (not encrypted)
+    encrypted_value = Column(Text, nullable=False)  # encrypted password or API key
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
