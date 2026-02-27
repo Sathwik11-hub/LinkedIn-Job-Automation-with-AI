@@ -7,6 +7,7 @@ import subprocess
 import sys
 import uuid
 import json
+import re as _re
 from pathlib import Path
 from datetime import datetime
 
@@ -14,10 +15,239 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 
 from backend.agents.autoagenthire_bot import AutoAgentHireBot
 
+# Database imports
+engine = None
+sql_text = None
+try:
+    from backend.database.connection import get_db_session, engine
+    from sqlalchemy import text as sql_text
+    DB_AVAILABLE = True
+except Exception:
+    DB_AVAILABLE = False
+
+# Resume parser import
+ResumeParser = None
+try:
+    from backend.parsers.resume_parser import ResumeParser
+    PARSER_AVAILABLE = True
+except Exception:
+    PARSER_AVAILABLE = False
+
 router = APIRouter(prefix="/api/v2", tags=["V2 Automation"])
 
 active_tasks = {}
 automation_results = {}
+
+
+def _save_application_to_db(app_data: dict, session_id: str):
+    """Persist a single application record to PostgreSQL using a lightweight v2_applications table."""
+    if not DB_AVAILABLE:
+        return
+    assert engine is not None and sql_text is not None
+    try:
+        _ensure_v2_tables()
+        with engine.connect() as conn:
+            conn.execute(sql_text("""
+                INSERT INTO v2_applications (session_id, job_title, company_name, job_url, status, match_score, applied_at, form_data)
+                VALUES (:sid, :title, :company, :url, :status, :score, CURRENT_TIMESTAMP, :form_data)
+            """), {
+                'sid': session_id,
+                'title': (app_data.get('title') or 'Unknown')[:200],
+                'company': (app_data.get('company') or 'Unknown')[:200],
+                'url': (app_data.get('url') or '')[:500],
+                'status': app_data.get('status', 'unknown'),
+                'score': float(app_data.get('matchScore') or 0),
+                'form_data': json.dumps(app_data),
+            })
+            conn.commit()
+    except Exception as e:
+        print(f"[DB] Failed to save application: {e}")
+
+
+def _create_agent_run(session_id: str, config: dict):
+    """Create an agent run record in the DB."""
+    if not DB_AVAILABLE:
+        return
+    assert engine is not None and sql_text is not None
+    try:
+        _ensure_v2_tables()
+        with engine.connect() as conn:
+            conn.execute(sql_text("""
+                INSERT INTO v2_agent_runs (session_id, status, keyword, location, max_applications, dry_run, started_at)
+                VALUES (:sid, 'running', :kw, :loc, :max, :dry, CURRENT_TIMESTAMP)
+            """), {
+                'sid': session_id,
+                'kw': config.get('keyword', ''),
+                'loc': config.get('location', ''),
+                'max': config.get('max_applications', 5),
+                'dry': config.get('dry_run', True),
+            })
+            conn.commit()
+    except Exception as e:
+        print(f"[DB] Failed to create agent run: {e}")
+
+
+def _complete_agent_run(session_id: str, task: dict):
+    """Finalise the agent run record."""
+    if not DB_AVAILABLE:
+        return
+    assert engine is not None and sql_text is not None
+    try:
+        with engine.connect() as conn:
+            conn.execute(sql_text("""
+                UPDATE v2_agent_runs
+                SET status = :status, completed_at = CURRENT_TIMESTAMP,
+                    jobs_found = :found, applications_submitted = :submitted, applications_failed = :failed
+                WHERE session_id = :sid
+            """), {
+                'sid': session_id,
+                'status': task.get('status', 'completed'),
+                'found': task.get('jobs_found', 0),
+                'submitted': task.get('applications_submitted', 0),
+                'failed': task.get('applications_failed', 0),
+            })
+            conn.commit()
+    except Exception as e:
+        print(f"[DB] Failed to complete agent run: {e}")
+
+
+_v2_tables_created = False
+
+def _ensure_v2_tables():
+    """Create lightweight v2 tables if they don't exist (no FK constraints)."""
+    global _v2_tables_created
+    if _v2_tables_created or not DB_AVAILABLE:
+        return
+    assert engine is not None and sql_text is not None
+    try:
+        with engine.connect() as conn:
+            conn.execute(sql_text("""
+                CREATE TABLE IF NOT EXISTS v2_agent_runs (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT UNIQUE NOT NULL,
+                    status TEXT DEFAULT 'pending',
+                    keyword TEXT,
+                    location TEXT,
+                    max_applications INTEGER DEFAULT 5,
+                    dry_run INTEGER DEFAULT 1,
+                    jobs_found INTEGER DEFAULT 0,
+                    applications_submitted INTEGER DEFAULT 0,
+                    applications_failed INTEGER DEFAULT 0,
+                    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TIMESTAMP
+                )
+            """))
+            conn.execute(sql_text("""
+                CREATE TABLE IF NOT EXISTS v2_applications (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    job_title TEXT,
+                    company_name TEXT,
+                    job_url TEXT,
+                    status TEXT DEFAULT 'unknown',
+                    match_score REAL DEFAULT 0,
+                    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    form_data TEXT
+                )
+            """))
+            conn.execute(sql_text("""
+                CREATE TABLE IF NOT EXISTS v2_user_profiles (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    first_name TEXT,
+                    last_name TEXT,
+                    email TEXT,
+                    phone TEXT,
+                    city TEXT,
+                    state TEXT,
+                    zip_code TEXT,
+                    country TEXT,
+                    address TEXT,
+                    linkedin_url TEXT,
+                    current_title TEXT,
+                    current_company TEXT,
+                    years_experience TEXT,
+                    skill_set TEXT,
+                    profile_json TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            conn.commit()
+        _v2_tables_created = True
+    except Exception as e:
+        print(f"[DB] Failed to create v2 tables: {e}")
+
+
+def _save_user_profile_to_db(session_id: str, user_profile: dict):
+    """Persist user profile to PostgreSQL before automation starts."""
+    if not DB_AVAILABLE:
+        return
+    assert engine is not None and sql_text is not None
+    try:
+        _ensure_v2_tables()
+        with engine.connect() as conn:
+            conn.execute(sql_text("""
+                INSERT INTO v2_user_profiles
+                    (session_id, first_name, last_name, email, phone, city, state,
+                     zip_code, country, address, linkedin_url, current_title,
+                     current_company, years_experience, skill_set, profile_json)
+                VALUES
+                    (:sid, :fn, :ln, :em, :ph, :ci, :st,
+                     :zc, :co, :ad, :li, :ct,
+                     :cc, :ye, :sk, :pj)
+            """), {
+                'sid': session_id,
+                'fn': (user_profile.get('first_name') or '')[:100],
+                'ln': (user_profile.get('last_name') or '')[:100],
+                'em': (user_profile.get('email') or '')[:200],
+                'ph': (user_profile.get('phone_number') or '')[:50],
+                'ci': (user_profile.get('city') or '')[:100],
+                'st': (user_profile.get('state') or '')[:100],
+                'zc': (user_profile.get('zip_code') or '')[:20],
+                'co': (user_profile.get('country') or '')[:100],
+                'ad': (user_profile.get('address') or '')[:300],
+                'li': (user_profile.get('linkedin_url') or '')[:500],
+                'ct': (user_profile.get('current_title') or '')[:200],
+                'cc': (user_profile.get('current_company') or '')[:200],
+                'ye': str(user_profile.get('years_experience', ''))[:10],
+                'sk': (user_profile.get('skill_set') or '')[:2000],
+                'pj': json.dumps(user_profile),
+            })
+            conn.commit()
+        print(f"[DB] User profile saved for session {session_id}")
+    except Exception as e:
+        print(f"[DB] Failed to save user profile: {e}")
+
+
+def _parse_resume_for_skills(resume_path: str) -> dict:
+    """Parse an uploaded resume and return a skill_experience map + raw_text."""
+    if not PARSER_AVAILABLE or not resume_path:
+        return {}
+    assert ResumeParser is not None
+    try:
+        parser = ResumeParser()
+        parsed = parser.parse(resume_path)
+        # Build skill → years map from parsed data
+        skill_exp = {}
+        for skill in (parsed.get('skills') or []):
+            skill_exp[skill.lower()] = 1  # default 1 year per listed skill
+        for exp in (parsed.get('experience') or []):
+            # If a duration is present, try to extract years
+            duration = str(exp.get('duration', '') or '')
+            nums = _re.findall(r'(\d+)', duration)
+            years = int(nums[0]) if nums else 1
+            title = (exp.get('title') or '').lower()
+            for word in title.split():
+                if len(word) > 2:
+                    skill_exp[word] = max(skill_exp.get(word, 0), years)
+        return {
+            'skill_experience': skill_exp,
+            'raw_text': parsed.get('raw_text', ''),
+            'parsed_contact': parsed.get('contact', {}),
+        }
+    except Exception as e:
+        print(f"[RESUME] Parse error: {e}")
+        return {}
 
 
 @router.post("/start-automation")
@@ -43,6 +273,7 @@ async def start_automation_v2(
     current_company: str = Form(""),
     current_title: str = Form(""),
     years_experience: str = Form("0"),
+    skill_set: str = Form(""),
     work_authorization_us: str = Form("Yes"),
     require_sponsorship: str = Form("No"),
     willing_to_relocate: str = Form("Yes"),
@@ -55,12 +286,44 @@ async def start_automation_v2(
     
     is_dry_run = dry_run.lower() == "true"
     
+    def _clean(val: str) -> str:
+        """Strip JS 'undefined'/'null'/whitespace-only strings coming from the frontend."""
+        if not val:
+            return ''
+        stripped = val.strip()
+        if stripped.lower() in ('undefined', 'null', 'none', 'nan'):
+            return ''
+        return stripped
+    
+    # Sanitize every field arriving from the browser
+    first_name = _clean(first_name)
+    last_name = _clean(last_name)
+    phone = _clean(phone)
+    phone_number = _clean(phone_number)
+    email = _clean(email)
+    city = _clean(city)
+    state = _clean(state)
+    zip_code = _clean(zip_code)
+    country = _clean(country) or 'United States'
+    address = _clean(address)
+    linkedin_url = _clean(linkedin_url)
+    github_url = _clean(github_url)
+    portfolio_url = _clean(portfolio_url)
+    current_company = _clean(current_company)
+    current_title = _clean(current_title)
+    years_experience = _clean(years_experience) or '0'
+    skill_set = _clean(skill_set)
+    
     # Use phone_number if phone is empty (frontend sends phone_number)
     actual_phone = phone or phone_number
     
     print(f"\n[AUTOMATION V2] Starting with dry_run={is_dry_run}")
-    print(f"[AUTOMATION V2] User: {first_name} {last_name}, Email: {email}, Phone: {actual_phone}")
-    print(f"[AUTOMATION V2] Location: {job_location}, City: {city}")
+    print(f"[AUTOMATION V2] User: first_name='{first_name}' last_name='{last_name}'")
+    print(f"[AUTOMATION V2] Email: '{email}', Phone: '{actual_phone}' (phone='{phone}', phone_number='{phone_number}')")
+    print(f"[AUTOMATION V2] City: '{city}', State: '{state}', Zip: '{zip_code}', Country: '{country}'")
+    print(f"[AUTOMATION V2] Address: '{address}', LinkedIn: '{linkedin_url}'")
+    print(f"[AUTOMATION V2] Current Title: '{current_title}', Company: '{current_company}'")
+    print(f"[AUTOMATION V2] Location: '{job_location}', Years Exp: '{years_experience}', Skills: '{skill_set}'")  
     
     resume_path = None
     if resume:
@@ -72,18 +335,24 @@ async def start_automation_v2(
             f.write(content)
         resume_path = str(resume_path)
     
+    # Parse resume to extract skills and experience
+    resume_data = _parse_resume_for_skills(resume_path) if resume_path else {}
+    parsed_contact = resume_data.get('parsed_contact', {})
+    
     user_profile = {
-        "first_name": first_name,
-        "last_name": last_name,
-        "full_name": f"{first_name} {last_name}".strip(),
-        "email": email,
-        "phone_number": actual_phone,
-        "phone": actual_phone,
+        "first_name": first_name if first_name else (parsed_contact.get('name', '').split()[0] if parsed_contact.get('name') else ''),
+        "last_name": last_name if last_name else (parsed_contact.get('name', '').split()[-1] if parsed_contact.get('name') and len(parsed_contact.get('name', '').split()) > 1 else ''),
+        "full_name": f"{first_name} {last_name}".strip() or parsed_contact.get('name', ''),
+        "email": email or parsed_contact.get('email', ''),
+        "phone_number": actual_phone or parsed_contact.get('phone', ''),
+        "phone": actual_phone or parsed_contact.get('phone', ''),
         "city": city,
         "state": state,
         "zip_code": zip_code,
+        "postal_code": zip_code,
         "country": country,
         "address": address,
+        "street": address,
         "street_address": address,
         "linkedin_url": linkedin_url,
         "github_url": github_url,
@@ -91,13 +360,18 @@ async def start_automation_v2(
         "current_company": current_company,
         "current_title": current_title,
         "years_experience": years_experience,
+        "skill_set": skill_set,
+        "work_authorization": work_authorization_us,
         "work_authorization_us": work_authorization_us,
+        "sponsorship": require_sponsorship,
         "require_sponsorship": require_sponsorship,
+        "relocate": "yes" if willing_to_relocate == "Yes" else "no",
         "willing_to_relocate": willing_to_relocate == "Yes",
         "visa_status": "Authorized to work" if work_authorization_us == "Yes" else "Requires sponsorship",
-        # Also store location for form filling
         "location": job_location,
         "preferred_location": job_location,
+        # Skill experience from resume parsing
+        "skill_experience": resume_data.get('skill_experience', {}),
     }
     
     active_tasks[session_id] = {
@@ -126,9 +400,12 @@ async def start_automation_v2(
         "linkedin_password": linkedin_password,
         "resume_path": resume_path,
         "user_profile": user_profile,
+        "resume_text": resume_data.get('raw_text', ''),
     }
     
     active_tasks[session_id]["config"] = config
+    _create_agent_run(session_id, config)
+    _save_user_profile_to_db(session_id, user_profile)
     asyncio.create_task(run_automation_v2(session_id, config))
     
     return {
@@ -158,6 +435,8 @@ async def run_playwright_subprocess(session_id: str, config: dict):
                 "dry_run": config.get("dry_run", True),
                 "headless": config.get("headless", False),
                 "user_profile": config.get("user_profile", {}),
+                "resume_path": config.get("resume_path", ""),
+                "resume_text": config.get("resume_text", ""),
             }
             
             config_json = json.dumps(subprocess_config)
@@ -173,6 +452,11 @@ async def run_playwright_subprocess(session_id: str, config: dict):
             task["status"] = "running"
             task["phase"] = "subprocess_started"
             
+            # Ensure subprocess uses UTF-8 encoding (critical on Windows)
+            import os as _os
+            subprocess_env = _os.environ.copy()
+            subprocess_env["PYTHONIOENCODING"] = "utf-8"
+            
             # Use subprocess.Popen with threading instead of asyncio
             process = subprocess.Popen(
                 [python_exe, str(runner_path), config_json],
@@ -180,43 +464,56 @@ async def run_playwright_subprocess(session_id: str, config: dict):
                 stderr=subprocess.STDOUT,
                 cwd=str(Path(__file__).parent.parent.parent),
                 text=True,
-                bufsize=1
+                bufsize=1,
+                env=subprocess_env,
             )
             
             # Stream output
             output_lines = []
-            for line in iter(process.stdout.readline, ''):
+            for line in iter(process.stdout.readline, '') if process.stdout else []:
                 if not line:
                     break
                 line_str = line.strip()
                 output_lines.append(line_str)
                 print(f"[SUBPROCESS] {line_str}")
                 
-                # Update task status based on output
-                if "Browser initialized" in line_str:
+                # Update task status based on output (matches new playwright_runner.py log format)
+                if "Browser initialized" in line_str or "[OK] Browser" in line_str:
                     task["phase"] = "browser_initialized"
-                elif "Login successful" in line_str or "Already logged in" in line_str:
+                elif "Login successful" in line_str or "Already logged in" in line_str or "[OK] Login" in line_str:
                     task["phase"] = "logged_in"
-                elif "Searching for jobs" in line_str:
+                elif "[SEARCH]" in line_str or "Starting job search" in line_str:
                     task["phase"] = "searching_jobs"
-                elif "Collected" in line_str and "jobs" in line_str:
+                elif "[OK] Collected" in line_str or ("Collected" in line_str and "jobs" in line_str) or "[COLLECT]" in line_str:
                     task["phase"] = "jobs_collected"
                     try:
                         import re
-                        match = re.search(r'Collected (\d+) jobs', line_str)
+                        match = re.search(r'Collected (\d+)', line_str)
                         if match:
                             task["jobs_found"] = int(match.group(1))
                             task["total_jobs"] = min(int(match.group(1)), config.get("max_applications", 5))
                     except:
                         pass
-                elif "Applying to:" in line_str:
+                elif "Found" in line_str and "Easy Apply" in line_str:
+                    task["phase"] = "jobs_collected"
+                    try:
+                        import re
+                        match = re.search(r'Found (\d+)', line_str) or re.search(r'Collected (\d+)', line_str)
+                        if match:
+                            task["jobs_found"] = int(match.group(1))
+                            task["total_jobs"] = min(int(match.group(1)), config.get("max_applications", 5))
+                    except:
+                        pass
+                elif "[APPLY] Applying to:" in line_str or "Applying to:" in line_str:
                     task["phase"] = "applying"
                     task["current_job"] = task.get("current_job", 0) + 1
                     task["current_job_title"] = line_str.split("Applying to:")[-1].strip()[:50]
-                elif "Application submitted" in line_str or "[SUCCESS]" in line_str:
+                elif "[SUCCESS]" in line_str or "Application submitted" in line_str:
                     task["applications_submitted"] = task.get("applications_submitted", 0) + 1
-                elif "DRY RUN" in line_str:
+                elif "[DRY RUN]" in line_str or "DRY RUN" in line_str:
                     task["applications_submitted"] = task.get("applications_submitted", 0) + 1
+                elif "[FATAL]" in line_str or "FATAL" in line_str:
+                    task["error"] = line_str.split("[FATAL]")[-1].strip()[:200] if "[FATAL]" in line_str else line_str[:200]
             
             process.wait()
             
@@ -240,16 +537,23 @@ async def run_playwright_subprocess(session_id: str, config: dict):
             if result_json:
                 try:
                     result = json.loads(result_json)
-                    automation_results[session_id]["results"] = [
-                        {
+                    app_results = []
+                    for app in result.get("applications", []):
+                        raw_status = app.get("status", "FAILED")
+                        app_record = {
                             "title": app.get("title", "Unknown"),
                             "company": app.get("company", "Unknown"),
-                            "status": "applied" if app.get("status") in ["APPLIED", "DRY_RUN"] else "failed",
+                            "url": app.get("url", ""),
+                            "status": raw_status,  # Keep original: APPLIED, DRY_RUN, FAILED, INCOMPLETE
                             "reason": app.get("error", ""),
                             "appliedAt": datetime.now().isoformat(),
+                            "matchScore": app.get("match_score", 0),
                         }
-                        for app in result.get("applications", [])
-                    ]
+                        app_results.append(app_record)
+                        # Persist to PostgreSQL
+                        _save_application_to_db(app_record, session_id)
+                    
+                    automation_results[session_id]["results"] = app_results
                     task["applications_submitted"] = len([a for a in result.get("applications", []) if a.get("status") in ["APPLIED", "DRY_RUN"]])
                     task["applications_failed"] = len([a for a in result.get("applications", []) if a.get("status") not in ["APPLIED", "DRY_RUN"]])
                 except json.JSONDecodeError as e:
@@ -258,6 +562,7 @@ async def run_playwright_subprocess(session_id: str, config: dict):
             
             task["status"] = "completed"
             task["phase"] = "finished"
+            _complete_agent_run(session_id, task)
             
             print(f"\n{'='*60}")
             print(f"✅ SUBPROCESS AUTOMATION COMPLETE")
@@ -455,3 +760,72 @@ async def get_automation_results_v2(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
     
     return automation_results[session_id]
+
+
+@router.get("/applications")
+async def get_all_applications():
+    """V2: Get all application records from PostgreSQL."""
+    if not DB_AVAILABLE:
+        return {"applications": [], "message": "Database not available"}
+    assert engine is not None and sql_text is not None
+    try:
+        _ensure_v2_tables()
+        with engine.connect() as conn:
+            rows = conn.execute(sql_text(
+                "SELECT id, session_id, job_title, company_name, job_url, status, match_score, applied_at "
+                "FROM v2_applications ORDER BY applied_at DESC LIMIT 200"
+            )).fetchall()
+        return {
+            "applications": [
+                {
+                    "id": r[0],
+                    "session_id": r[1],
+                    "title": r[2],
+                    "company": r[3],
+                    "url": r[4],
+                    "status": r[5],
+                    "matchScore": r[6],
+                    "appliedAt": r[7].isoformat() if r[7] else None,
+                }
+                for r in rows
+            ]
+        }
+    except Exception as e:
+        return {"applications": [], "error": str(e)}
+
+
+@router.get("/agent-runs")
+async def get_all_agent_runs():
+    """V2: Get all agent run records from PostgreSQL."""
+    if not DB_AVAILABLE:
+        return {"runs": [], "message": "Database not available"}
+    assert engine is not None and sql_text is not None
+    try:
+        _ensure_v2_tables()
+        with engine.connect() as conn:
+            rows = conn.execute(sql_text(
+                "SELECT id, session_id, status, keyword, location, max_applications, dry_run, "
+                "jobs_found, applications_submitted, applications_failed, started_at, completed_at "
+                "FROM v2_agent_runs ORDER BY started_at DESC LIMIT 50"
+            )).fetchall()
+        return {
+            "runs": [
+                {
+                    "id": r[0],
+                    "session_id": r[1],
+                    "status": r[2],
+                    "keyword": r[3],
+                    "location": r[4],
+                    "max_applications": r[5],
+                    "dry_run": r[6],
+                    "jobs_found": r[7],
+                    "applications_submitted": r[8],
+                    "applications_failed": r[9],
+                    "started_at": r[10].isoformat() if r[10] else None,
+                    "completed_at": r[11].isoformat() if r[11] else None,
+                }
+                for r in rows
+            ]
+        }
+    except Exception as e:
+        return {"runs": [], "error": str(e)}

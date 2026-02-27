@@ -146,28 +146,28 @@ class ResumeIntelligence:
     def _extract_text_from_pdf(self, file_path: Path) -> str:
         """Extract text from PDF file"""
         try:
-        with open(file_path, "rb") as file:
-            reader = PdfReader(file)
-            text = ""
-            for page in reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-            return text.strip()
-    except Exception as e:
-        logger.error(f"❌ PDF extraction failed: {e}")
-        raise
+            with open(file_path, "rb") as file:
+                reader = PdfReader(file)
+                text = ""
+                for page in reader.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
+                return text.strip()
+        except Exception as e:
+            logger.error(f"❌ PDF extraction failed: {e}")
+            raise
 
     
-    # def _extract_text_from_docx(self, file_path: Path) -> str:
-    #     """Extract text from DOCX file"""
-         # try:
-         #         doc = docx.Document(str(file_path))
-    #         text = "\n".join([para.text for para in doc.paragraphs])
-    #         return text.strip()
-    #     except Exception as e:
-    #         logger.error(f"❌ DOCX extraction failed: {e}")
-    #         raise
+    def _extract_text_from_docx(self, file_path: Path) -> str:
+        """Extract text from DOCX file"""
+        try:
+            doc = docx.Document(str(file_path))
+            text = "\n".join([para.text for para in doc.paragraphs])
+            return text.strip()
+        except Exception as e:
+            logger.error(f"❌ DOCX extraction failed: {e}")
+            raise
     
     def _parse_with_llm(self, raw_text: str) -> ResumeData:
         """

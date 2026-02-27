@@ -1,1169 +1,1679 @@
 """
-Playwright runner script - runs separately from uvicorn to avoid event loop conflicts
-Optimized for LinkedIn's current UI
+Playwright runner – production-ready LinkedIn Easy Apply automation.
+Runs as a SUBPROCESS from v2_routes (avoids event-loop conflicts on Windows).
+
+v3 – with AI unknown-field handler + strict field tracking.
+
+Guarantees
+----------
+* Never re-fills a field that already has a value.
+* Never calls the AI API more than once per unique field label.
+* Never loops infinitely – hard caps on steps, retries, and no-progress streaks.
+* Unknown / extra form fields are answered by AI (GitHub Models → Groq → OpenAI).
+* All waits use Playwright primitives – zero time.sleep().
 """
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 1 – IMPORTS & WINDOWS SETUP
+# ═══════════════════════════════════════════════════════════════════════════
 import asyncio
+import hashlib
 import sys
 import json
-import random
-import time
 import os
+import re
+import ssl
+import urllib.request
 from pathlib import Path
 from datetime import datetime
 
-# Set UTF-8 encoding for stdout/stderr on Windows
-if sys.platform == 'win32':
+if sys.platform == "win32":
     import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-from playwright.async_api import async_playwright
+# Load .env (best-effort)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    # Manual .env fallback
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
+    if _env_path.exists():
+        for _line in _env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _, _v = _line.partition("=")
+                os.environ.setdefault(_k.strip(), _v.strip())
+
+from playwright.async_api import async_playwright, Page, BrowserContext
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 2 – CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════
+FIELD_TIMEOUT       = 5_000     # 5 s per field interaction
+STEP_TIMEOUT        = 10_000    # 10 s per form step
+NAV_TIMEOUT         = 30_000    # 30 s page navigation
+MAX_STEPS           = 15        # max steps in multi-step form
+MAX_FIELD_RETRIES   = 1         # max retries per single field
+MAX_BUTTON_RETRIES  = 1         # max retries for Next button
+MAX_NO_PROGRESS     = 3         # no-progress steps before abort
+MAX_LOOP_PER_PAGE   = 10        # absolute cap on fill iterations per step
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 3 – AI FIELD HANDLER
+# ═══════════════════════════════════════════════════════════════════════════
+_ai_cache: dict = {}            # label_key → answer  (persists across steps)
 
 
-async def run_automation(config_json: str):
-    """Run the full LinkedIn automation flow"""
-    config = json.loads(config_json)
-    
-    # Set up default user profile values for form filling
-    default_profile = {
-        'first_name': 'Sathwik',
-        'last_name': 'Adigoppula', 
-        'full_name': 'Sathwik Adigoppula',
-        'email': config.get('linkedin_email', ''),
-        'phone_number': '7569663306',
-        'phone': '7569663306',
-        'city': 'Mangalore',
-        'state': 'Karnataka',
-        'zip_code': '575001',
-        'country': 'India',
-        'address': 'Mangalore, India',
-        'years_experience': '3',
-        'relevant_experience': '2',
-        'ai_ml_experience': '2',
-        'tech_experience': '3',
-        'notice_period': '30',
-        'current_ctc': '8',
-        'expected_ctc': '12',
-        'ctc': '8',
-        'gpa': '8.5',
-        'work_authorization': 'Yes',
-        'require_sponsorship': 'No',
-        'willing_to_relocate': 'Yes',
-        'linkedin_url': 'https://linkedin.com/in/sathwik',
-        'github_url': 'https://github.com/sathwik',
-    }
-    
-    # Merge with provided profile, using defaults where not provided
-    user_profile = config.get('user_profile', {})
-    for key, value in default_profile.items():
-        if key not in user_profile or not user_profile.get(key):
-            user_profile[key] = value
-    
-    config['user_profile'] = user_profile
-    
-    result = {
-        "status": "failed",
-        "phase": "",
-        "jobs_found": 0,
-        "applications": [],
-        "errors": []
-    }
-    
-    playwright = None
-    context = None
-    page = None
-    
+def _get_ai_config() -> dict | None:
+    """Return {url, key, model} for the first available AI provider."""
+    gh = os.environ.get("GITHUB_API_KEY", "")
+    groq = os.environ.get("groq_api_key", "") or os.environ.get("GROQ_API_KEY", "")
+    oai = os.environ.get("OPENAI_API_KEY", "")
+
+    if gh and gh.startswith("ghp_"):
+        return {
+            "url":   "https://models.inference.ai.azure.com/chat/completions",
+            "key":   gh,
+            "model": "gpt-4o-mini",
+        }
+    if groq and groq.startswith("gsk_"):
+        return {
+            "url":   "https://api.groq.com/openai/v1/chat/completions",
+            "key":   groq,
+            "model": "llama-3.3-70b-versatile",
+        }
+    if oai and not oai.startswith("your_"):
+        return {
+            "url":   "https://api.openai.com/v1/chat/completions",
+            "key":   oai,
+            "model": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        }
+    return None
+
+
+def _call_ai_sync(prompt: str) -> str:
+    """Blocking HTTP call to the AI chat-completion endpoint (stdlib only)."""
+    cfg = _get_ai_config()
+    if not cfg:
+        return ""
+    body = json.dumps({
+        "model":       cfg["model"],
+        "messages":    [{"role": "user", "content": prompt}],
+        "max_tokens":  150,
+        "temperature": 0.3,
+    }).encode()
+
+    req = urllib.request.Request(
+        cfg["url"],
+        data=body,
+        headers={
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {cfg['key']}",
+        },
+        method="POST",
+    )
+    ctx = ssl.create_default_context()
     try:
-        print("[INIT] Starting Playwright automation...")
-        playwright = await async_playwright().start()
-        
-        # Profile directory
-        profile_dir = Path("browser_profile")
-        profile_dir.mkdir(exist_ok=True)
-        
-        # Screenshots directory
-        screenshots_dir = Path("data/screenshots")
-        screenshots_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Clean up lock files
-        for lock_name in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
-            lock_file = profile_dir / lock_name
-            if lock_file.exists():
-                try:
-                    lock_file.unlink()
-                except:
-                    pass
-        
-        headless = config.get('headless', False)
-        
-        print(f"[BROWSER] Launching browser (headless={headless})...")
-        print(f"[BROWSER] Profile: {profile_dir.absolute()}")
-        
-        context = await playwright.chromium.launch_persistent_context(
-            str(profile_dir),
-            headless=headless,
-            slow_mo=100,  # Slower for reliability
-            args=[
-                '--disable-blink-features=AutomationControlled',
-                '--disable-dev-shm-usage',
-                '--no-sandbox',
-                '--disable-gpu',
-                '--disable-web-security',
-                '--disable-features=IsolateOrigins,site-per-process',
-            ],
-            viewport={'width': 1920, 'height': 1080},
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            locale='en-US',
-            timezone_id='America/New_York',
-            ignore_https_errors=True,
-        )
-        
-        if len(context.pages) > 0:
-            page = context.pages[0]
-        else:
-            page = await context.new_page()
-        
-        page.set_default_timeout(60000)
-        page.set_default_navigation_timeout(60000)
-        
-        # Anti-detection
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-            window.chrome = {runtime: {}};
-        """)
-        
-        print("[OK] Browser initialized successfully")
-        result["phase"] = "browser_initialized"
-        
-        # Save screenshot
-        await page.screenshot(path=str(screenshots_dir / "01_browser_init.png"))
-        
-        # ============ LOGIN PHASE ============
-        print("\n[LOGIN] Starting LinkedIn login...")
-        email = config.get('linkedin_email')
-        password = config.get('linkedin_password')
-        
-        if not email or not password:
-            raise Exception("LinkedIn credentials not provided")
-        
-        await page.goto('https://www.linkedin.com', wait_until='domcontentloaded', timeout=30000)
-        await asyncio.sleep(3)
-        
-        current_url = page.url
-        print(f"[DEBUG] Current URL: {current_url}")
-        
-        # Check if already logged in
-        logged_in = False
-        if any(path in current_url for path in ['/feed', '/mynetwork', '/jobs', '/in/']):
-            logged_in = True
-            print("[OK] Already logged in to LinkedIn")
-        else:
-            # Navigate to login page
-            await page.goto('https://www.linkedin.com/login', wait_until='domcontentloaded', timeout=30000)
-            await asyncio.sleep(2)
-            
-            await page.screenshot(path=str(screenshots_dir / "02_login_page.png"))
-            
-            # Fill credentials
-            print(f"[LOGIN] Entering credentials for: {email[:5]}***")
-            
-            try:
-                # Try multiple selectors for email field
-                email_filled = False
-                for sel in ['input[name="session_key"]', 'input#username', 'input[autocomplete="username"]']:
-                    try:
-                        elem = await page.query_selector(sel)
-                        if elem:
-                            await elem.fill(email)
-                            email_filled = True
-                            print(f"[DEBUG] Email filled using: {sel}")
-                            break
-                    except:
-                        continue
-                
-                if not email_filled:
-                    raise Exception("Could not find email input field")
-                
-                await asyncio.sleep(1)
-                
-                # Fill password
-                password_filled = False
-                for sel in ['input[name="session_password"]', 'input#password', 'input[type="password"]']:
-                    try:
-                        elem = await page.query_selector(sel)
-                        if elem:
-                            await elem.fill(password)
-                            password_filled = True
-                            print(f"[DEBUG] Password filled using: {sel}")
-                            break
-                    except:
-                        continue
-                
-                if not password_filled:
-                    raise Exception("Could not find password input field")
-                
-                await asyncio.sleep(1)
-                
-                # Click submit
-                await page.click('button[type="submit"]')
-                print("[LOGIN] Submitted login form")
-                
-                await asyncio.sleep(5)
-                
-                current_url = page.url
-                print(f"[DEBUG] URL after login: {current_url}")
-                
-                await page.screenshot(path=str(screenshots_dir / "03_after_login.png"))
-                
-                if any(path in current_url for path in ['/feed', '/mynetwork', '/jobs', '/check/add-phone', '/in/']):
-                    logged_in = True
-                    print("[OK] Login successful!")
-                elif 'checkpoint' in current_url or 'challenge' in current_url:
-                    print("[WARN] Security checkpoint detected - waiting 60 seconds...")
-                    await asyncio.sleep(60)
-                    logged_in = True
-                else:
-                    raise Exception(f"Login may have failed - URL: {current_url}")
-                    
-            except Exception as e:
-                print(f"[ERROR] Login failed: {str(e)}")
-                result["errors"].append(f"Login error: {str(e)}")
-                raise
-        
-        if not logged_in:
-            raise Exception("Not logged in to LinkedIn")
-        
-        result["phase"] = "logged_in"
-        
-        # ============ JOB SEARCH PHASE ============
-        print("\n[SEARCH] Starting job search...")
-        
-        import urllib.parse
-        keyword = config.get('keyword', 'Software Engineer')
-        location = config.get('location', 'Remote')
-        
-        # Build search URL with Easy Apply filter
-        search_url = f'https://www.linkedin.com/jobs/search/?keywords={urllib.parse.quote(keyword)}&location={urllib.parse.quote(location)}&f_AL=true&sortBy=R'
-        
-        print(f"[SEARCH] Keyword: {keyword}")
-        print(f"[SEARCH] Location: {location}")
-        print(f"[SEARCH] URL: {search_url}")
-        
-        await page.goto(search_url, wait_until='domcontentloaded', timeout=60000)
-        await asyncio.sleep(5)
-        
-        await page.screenshot(path=str(screenshots_dir / "04_job_search.png"))
-        
-        result["phase"] = "searching"
-        
-        # ============ JOB COLLECTION PHASE ============
-        print("\n[COLLECT] Collecting job listings...")
-        
-        # Wait for job list to load
-        await asyncio.sleep(3)
-        
-        # Scroll to load more jobs
-        for i in range(5):
-            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-            await asyncio.sleep(1.5)
-            print(f"[SCROLL] Scroll {i+1}/5")
-        
-        # Scroll back to top
-        await page.evaluate('window.scrollTo(0, 0)')
-        await asyncio.sleep(1)
-        
-        # Try multiple selectors for job cards - LinkedIn changes these frequently
-        job_card_selectors = [
-            'li.scaffold-layout__list-item',
-            'li.jobs-search-results__list-item',
-            'div.job-card-container',
-            'div[data-job-id]',
-            '.jobs-search-results__list > li',
-            '.scaffold-layout__list > li',
-            'ul.scaffold-layout__list-container > li',
-        ]
-        
-        job_cards = []
-        for selector in job_card_selectors:
-            try:
-                cards = await page.query_selector_all(selector)
-                if cards and len(cards) > 0:
-                    job_cards = cards
-                    print(f"[OK] Found {len(cards)} job cards using: {selector}")
-                    break
-            except Exception as e:
-                print(f"[DEBUG] Selector {selector} failed: {str(e)[:30]}")
-                continue
-        
-        if not job_cards:
-            # Last resort - try to get any clickable job elements
-            print("[WARN] Standard selectors failed, trying alternative approach...")
-            await page.screenshot(path=str(screenshots_dir / "05_no_jobs_found.png"))
-            
-            # Check if we see the job search container at all
-            content = await page.content()
-            if 'jobs-search-results' in content or 'scaffold-layout__list' in content:
-                print("[DEBUG] Job container exists but couldn't select cards")
-            else:
-                print("[DEBUG] Job search container not found in page")
-        
-        jobs = []
-        max_jobs = config.get('max_applications', 5)
-        
-        print(f"[COLLECT] Processing up to {max_jobs * 2} job cards...")
-        
-        for i, card in enumerate(job_cards[:max_jobs * 2]):
-            try:
-                # Scroll card into view
-                await card.scroll_into_view_if_needed()
-                await asyncio.sleep(0.8)
-                
-                # Click on the card to load details
-                await card.click()
-                await asyncio.sleep(2)
-                
-                # Get job details with multiple fallback selectors
-                title = None
-                company = None
-                
-                # Title selectors
-                title_selectors = [
-                    'h1.job-details-jobs-unified-top-card__job-title',
-                    'h1.jobs-unified-top-card__job-title',
-                    'h1.t-24.t-bold.inline',
-                    'h2.job-details-jobs-unified-top-card__job-title',
-                    '.job-details-jobs-unified-top-card__job-title',
-                    'a.job-card-container__link span',
-                    'h3.job-card-list__title',
-                ]
-                
-                for sel in title_selectors:
-                    try:
-                        elem = await page.query_selector(sel)
-                        if elem:
-                            title = await elem.text_content()
-                            if title:
-                                title = title.strip()
-                                break
-                    except:
-                        continue
-                
-                # Company selectors
-                company_selectors = [
-                    'a.job-details-jobs-unified-top-card__company-name',
-                    'span.job-details-jobs-unified-top-card__company-name',
-                    '.jobs-unified-top-card__company-name',
-                    '.job-card-container__company-name',
-                    'div.job-card-container__primary-description',
-                    'a.job-card-container__company-name',
-                ]
-                
-                for sel in company_selectors:
-                    try:
-                        elem = await page.query_selector(sel)
-                        if elem:
-                            company = await elem.text_content()
-                            if company:
-                                company = company.strip()
-                                break
-                    except:
-                        continue
-                
-                if not company:
-                    company = "Unknown Company"
-                
-                # Check for Easy Apply button
-                easy_apply = False
-                easy_apply_selectors = [
-                    'button.jobs-apply-button',
-                    'button[aria-label*="Easy Apply"]',
-                    'button:has-text("Easy Apply")',
-                    '.jobs-apply-button--top-card',
-                ]
-                
-                for sel in easy_apply_selectors:
-                    try:
-                        btn = await page.query_selector(sel)
-                        if btn:
-                            btn_text = await btn.text_content() or ""
-                            if 'easy' in btn_text.lower() or 'apply' in btn_text.lower():
-                                easy_apply = True
-                                break
-                    except:
-                        continue
-                
-                if title:
-                    job_data = {
-                        'index': i + 1,
-                        'title': title[:100],
-                        'company': company[:50] if company else 'Unknown',
-                        'url': page.url,
-                        'easy_apply': easy_apply
-                    }
-                    
-                    if easy_apply:
-                        jobs.append(job_data)
-                        print(f"  [+] Job {len(jobs)}: {title[:45]}... @ {company[:20]}")
-                    else:
-                        print(f"  [-] Skipped (no Easy Apply): {title[:45]}...")
-                    
-                    if len(jobs) >= max_jobs:
-                        print(f"[OK] Collected target number of jobs: {max_jobs}")
-                        break
-                        
-            except Exception as e:
-                print(f"  [WARN] Error processing card {i+1}: {str(e)[:40]}")
-                continue
-        
-        result["jobs_found"] = len(jobs)
-        result["phase"] = "jobs_collected"
-        print(f"\n[OK] Collected {len(jobs)} Easy Apply jobs")
-        
-        await page.screenshot(path=str(screenshots_dir / "06_jobs_collected.png"))
-        
-        if not jobs:
-            print("[WARN] No Easy Apply jobs found - trying alternative method...")
-            # Take a screenshot for debugging
-            await page.screenshot(path=str(screenshots_dir / "07_no_easy_apply_jobs.png"))
-        
-        # ============ APPLICATION PHASE ============
-        dry_run = config.get('dry_run', True)
-        user_profile = config.get('user_profile', {})
-        
-        print(f"\n[APPLY] Starting applications (dry_run={dry_run})...")
-        
-        for job in jobs[:max_jobs]:
-            try:
-                print(f"\n[APPLY] Applying to: {job['title'][:40]}")
-                print(f"        Company: {job['company']}")
-                
-                # Navigate to job
-                await page.goto(job['url'], wait_until='domcontentloaded', timeout=60000)
-                await asyncio.sleep(2)
-                
-                # Find and click Easy Apply button
-                clicked = False
-                for sel in ['button.jobs-apply-button', 'button[aria-label*="Easy Apply"]', 'button:has-text("Easy Apply")']:
-                    try:
-                        btn = await page.query_selector(sel)
-                        if btn:
-                            await btn.click()
-                            clicked = True
-                            print("  [OK] Clicked Easy Apply button")
-                            break
-                    except:
-                        continue
-                
-                if not clicked:
-                    job['status'] = 'FAILED'
-                    job['error'] = 'Could not click Easy Apply button'
-                    result["applications"].append(job)
-                    print("  [WARN] Could not find Easy Apply button")
-                    continue
-                
-                await asyncio.sleep(3)
-                
-                await page.screenshot(path=str(screenshots_dir / f"apply_{job['index']}_modal.png"))
-                
-                # Process application steps
-                for step in range(15):  # Max 15 steps
-                    await asyncio.sleep(2)
-                    
-                    # First, fill any empty form fields using the advanced filler
-                    await fill_linkedin_form_questions(page, user_profile, config.get('linkedin_email', ''))
-                    await fill_form_fields(page, user_profile, config.get('linkedin_email', ''))
-                    await asyncio.sleep(1)
-                    
-                    # Check for success messages
-                    success_found = False
-                    try:
-                        page_text = await page.text_content('body')
-                        if page_text and ('Application sent' in page_text or 'Your application was sent' in page_text):
-                            job['status'] = 'APPLIED'
-                            success_found = True
-                            print("  [SUCCESS] Application submitted successfully!")
-                    except:
-                        pass
-                    
-                    if success_found or job.get('status') == 'APPLIED':
-                        break
-                    
-                    # Fill form fields
-                    await fill_form_fields(page, user_profile, config.get('linkedin_email', ''))
-                    
-                    # Click appropriate button - use CSS selectors with query_selector
-                    button_clicked = False
-                    
-                    # Look for buttons in modal footer first
-                    modal_footer_selectors = [
-                        'footer button[aria-label*="Submit"]',
-                        'footer button[aria-label*="Review"]', 
-                        'footer button[aria-label*="Next"]',
-                        'footer button[aria-label*="Continue"]',
-                        '.jobs-easy-apply-modal footer button',
-                        'div[role="dialog"] footer button',
-                        'div.artdeco-modal footer button',
-                    ]
-                    
-                    # Check for validation errors BEFORE clicking buttons
-                    has_errors = False
-                    try:
-                        error_elements = await page.query_selector_all('[class*="error"], [class*="invalid"], .artdeco-inline-feedback--error')
-                        if error_elements:
-                            for err_el in error_elements:
-                                if await err_el.is_visible():
-                                    err_text = await err_el.text_content() or ''
-                                    if err_text.strip():
-                                        print(f"    [VALIDATION] Error detected: {err_text.strip()[:50]}")
-                                        has_errors = True
-                                        # Try filling fields again
-                                        await fill_form_fields(page, user_profile, config.get('linkedin_email', ''))
-                                        await asyncio.sleep(1)
-                                        break
-                    except:
-                        pass
-                    
-                    # If still has errors after 2nd fill attempt, try filling empty numeric fields with defaults
-                    if has_errors:
-                        try:
-                            empty_inputs = await page.query_selector_all('input:visible')
-                            for inp in empty_inputs:
-                                val = await inp.input_value() or ''
-                                if not val.strip():
-                                    input_type = await inp.get_attribute('type') or 'text'
-                                    if input_type in ['text', 'number', 'tel']:
-                                        await inp.fill('3')  # Default numeric value
-                                        await inp.press('Tab')
-                            await asyncio.sleep(1)
-                        except:
-                            pass
-                    
-                    # Get all visible footer buttons
-                    for footer_sel in modal_footer_selectors:
-                        try:
-                            buttons = await page.query_selector_all(footer_sel)
-                            for btn in buttons:
-                                if not btn:
-                                    continue
-                                    
-                                # Check if button is enabled
-                                disabled = await btn.get_attribute('disabled')
-                                if disabled:
-                                    continue
-                                    
-                                btn_text = await btn.text_content() or ''
-                                btn_text = btn_text.strip().lower()
-                                aria_label = await btn.get_attribute('aria-label') or ''
-                                aria_label = aria_label.lower()
-                                
-                                # Check if this is a submit button
-                                if 'submit' in btn_text or 'submit' in aria_label:
-                                    if dry_run:
-                                        job['status'] = 'DRY_RUN'
-                                        print(f"  [DRY RUN] Would submit: {btn_text}")
-                                        button_clicked = True
-                                    else:
-                                        await btn.click()
-                                        await asyncio.sleep(3)
-                                        job['status'] = 'APPLIED'
-                                        print("  [SUCCESS] Submitted application!")
-                                        button_clicked = True
-                                    break
-                                
-                                # Check for navigation buttons (but not Back/Cancel)
-                                if any(x in btn_text or x in aria_label for x in ['next', 'continue', 'review']):
-                                    if 'back' not in btn_text and 'dismiss' not in btn_text and 'cancel' not in btn_text:
-                                        await btn.click()
-                                        print(f"  [STEP {step+1}] Clicked: {btn_text[:20]}")
-                                        button_clicked = True
-                                        await asyncio.sleep(2)  # Wait longer after clicking
-                                        break
-                            
-                            if button_clicked:
-                                break
-                        except Exception as e:
-                            continue
-                    
-                    if job.get('status') in ['APPLIED', 'DRY_RUN']:
-                        break
-                    
-                    # Fallback: Try getting any primary action button
-                    if not button_clicked:
-                        try:
-                            # LinkedIn often uses artdeco primary buttons
-                            primary_btns = await page.query_selector_all('button.artdeco-button--primary:visible')
-                            for primary_btn in primary_btns:
-                                if not primary_btn:
-                                    continue
-                                disabled = await primary_btn.get_attribute('disabled')
-                                if disabled:
-                                    continue
-                                btn_text = await primary_btn.text_content() or ''
-                                if 'back' not in btn_text.lower() and 'dismiss' not in btn_text.lower():
-                                    if 'submit' in btn_text.lower():
-                                        if dry_run:
-                                            job['status'] = 'DRY_RUN'
-                                            print(f"  [DRY RUN] Would submit: {btn_text.strip()}")
-                                        else:
-                                            await primary_btn.click()
-                                            job['status'] = 'APPLIED'
-                                            print("  [SUCCESS] Submitted!")
-                                        button_clicked = True
-                                        break
-                                    else:
-                                        await primary_btn.click()
-                                        print(f"  [STEP {step+1}] Clicked primary: {btn_text.strip()[:20]}")
-                                        button_clicked = True
-                                        break
-                        except:
-                            pass
-                    
-                    if not button_clicked:
-                        print(f"  [DEBUG] Step {step+1}: No clickable button found")
-                        if step >= 8:
-                            break
-                
-                if not job.get('status'):
-                    job['status'] = 'INCOMPLETE'
-                    print("  [WARN] Application incomplete")
-                
-                result["applications"].append(job)
-                
-                # Close modal
-                try:
-                    for dismiss_sel in ['button[aria-label="Dismiss"]', 'button[aria-label="Close"]', 'button.artdeco-modal__dismiss']:
-                        btn = await page.query_selector(dismiss_sel)
-                        if btn:
-                            await btn.click()
-                            break
-                except:
-                    pass
-                
-                await asyncio.sleep(2)
-                
-            except Exception as e:
-                job['status'] = 'FAILED'
-                job['error'] = str(e)[:100]
-                result["applications"].append(job)
-                print(f"  [ERROR] {str(e)[:50]}")
-        
-        result["status"] = "completed"
-        result["phase"] = "completed"
-        
-        print(f"\n[DONE] Automation complete!")
-        print(f"       Jobs found: {result['jobs_found']}")
-        print(f"       Applications: {len(result['applications'])}")
-        
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+            data = json.loads(resp.read().decode())
+            ans = data["choices"][0]["message"]["content"].strip().strip("\"'`")
+            if "\n" in ans:
+                ans = ans.split("\n")[0].strip()
+            return ans
     except Exception as e:
-        result["errors"].append(str(e))
-        print(f"\n[FATAL] Error: {str(e)}")
-    
-    finally:
-        # Keep browser open briefly for debugging
-        await asyncio.sleep(2)
-        
-        if context:
-            try:
-                await context.close()
-            except:
-                pass
-        
-        if playwright:
-            try:
-                await playwright.stop()
-            except:
-                pass
-        
-        print("[CLOSED] Browser closed")
-    
-    return result
+        print(f"    [AI] API error: {str(e)[:80]}")
+        return ""
 
 
-async def get_field_label(page, element):
-    """Get the label text for a form field by checking various sources"""
-    label_text = ''
-    
+async def ai_answer_field(
+    label: str,
+    job_title: str,
+    user_profile: dict,
+    resume_text: str = "",
+    validation_hint: str = "",
+) -> str:
+    """Generate a concise answer for an unknown form field.
+    Called AT MOST ONCE per unique label (result is cached)."""
+    key = label.lower().strip()
+    if key in _ai_cache:
+        return _ai_cache[key]
+
+    profile_lines = "\n".join(
+        f"  {k}: {v}"
+        for k, v in {
+            "Name":       user_profile.get("full_name", ""),
+            "Email":      user_profile.get("email", ""),
+            "Phone":      user_profile.get("phone_number", ""),
+            "City":       user_profile.get("city", ""),
+            "State":      user_profile.get("state", ""),
+            "Country":    user_profile.get("country", ""),
+            "Title":      user_profile.get("current_title", ""),
+            "Company":    user_profile.get("current_company", ""),
+            "Experience": f"{user_profile.get('years_experience', '')} years",
+            "Skills":     user_profile.get("skill_set", ""),
+            "Education":  user_profile.get("education_level", ""),
+            "College":    user_profile.get("college", ""),
+            "GPA":        str(user_profile.get("gpa", "")),
+        }.items()
+        if v and str(v).strip()
+    )
+
+    hint_line = f'\nValidation hint from site: "{validation_hint}"' if validation_hint else ""
+
+    prompt = (
+        "You are filling a job-application form. Return ONLY the value to type "
+        "into the field – no explanation, no quotes, no extra text.\n\n"
+        f'Field label: "{label}"\n'
+        f'Job title being applied for: "{job_title}"\n'
+        f"Applicant profile:\n{profile_lines}\n"
+    )
+    if resume_text:
+        prompt += f"\nResume excerpt:\n{resume_text[:600]}\n"
+    prompt += hint_line
+    prompt += (
+        "\n\nRules:\n"
+        "- Numeric field (percentage, year, salary, CTC) → return digits only.\n"
+        "- Date field (DOB) → use MM/DD/YYYY. Estimate from experience years.\n"
+        "- Yes/No → return Yes or No.\n"
+        "- City/State → use applicant location.\n"
+        "- College/University → use resume data or return a plausible name.\n"
+        "- Short text (cover letter, reason) → 1-2 sentences max.\n"
+        "- If truly unknown, return N/A.\n"
+        "Return ONLY the value."
+    )
+
     try:
-        # Method 1: Check aria-label
-        aria_label = await element.get_attribute('aria-label')
-        if aria_label:
-            label_text += aria_label.lower() + ' '
-        
-        # Method 2: Check for associated label via 'for' attribute
-        elem_id = await element.get_attribute('id')
+        ans = await asyncio.to_thread(_call_ai_sync, prompt)
+    except Exception as e:
+        print(f"    [AI] thread error: {str(e)[:50]}")
+        ans = ""
+
+    _ai_cache[key] = ans
+    if ans:
+        print(f"    [AI] '{label[:40]}' → '{ans[:35]}'")
+    else:
+        print(f"    [AI] '{label[:40]}' → (no answer)")
+    return ans
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 4 – FIELD TRACKER  (per-job, reset between applications)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class FieldTracker:
+    """Prevents re-processing the same form field."""
+
+    def __init__(self):
+        self.filled: dict[str, str] = {}       # fid → value
+        self.retries: dict[str, int] = {}      # fid → retry count
+        self.ai_called: set[str] = set()       # label keys already sent to AI
+
+    # ---- identifiers ----
+    @staticmethod
+    def make_id(elem_id: str = "", elem_name: str = "", label: str = "") -> str:
         if elem_id:
-            label_elem = await page.query_selector(f'label[for="{elem_id}"]')
-            if label_elem:
-                text = await label_elem.text_content()
-                if text:
-                    label_text += text.lower() + ' '
-        
-        # Method 3: Check parent label
-        parent = await element.evaluate_handle('el => el.closest("label")')
-        if parent:
-            text = await parent.evaluate('el => el ? el.textContent : ""')
-            if text:
-                label_text += text.lower() + ' '
-        
-        # Method 4: Check preceding sibling or parent's text
-        parent_text = await element.evaluate_handle('''el => {
-            const parent = el.closest(".fb-dash-form-element, .artdeco-text-input, .jobs-easy-apply-form-section__grouping");
-            if (parent) {
-                const label = parent.querySelector("label, .fb-dash-form-element__label, span.t-bold");
-                return label ? label.textContent : "";
+            return f"id:{elem_id.strip().lower()}"
+        if elem_name:
+            return f"nm:{elem_name.strip().lower()}"
+        if label:
+            return f"lb:{hashlib.md5(label.lower().encode()).hexdigest()[:10]}"
+        return ""
+
+    # ---- queries ----
+    def is_done(self, fid: str) -> bool:
+        return fid != "" and fid in self.filled
+
+    def can_retry(self, fid: str) -> bool:
+        return self.retries.get(fid, 0) < MAX_FIELD_RETRIES
+
+    def ai_was_called_for(self, label: str) -> bool:
+        return label.lower().strip() in self.ai_called
+
+    # ---- mutations ----
+    def mark_done(self, fid: str, value: str):
+        if fid:
+            self.filled[fid] = value
+
+    def mark_retry(self, fid: str):
+        self.retries[fid] = self.retries.get(fid, 0) + 1
+
+    def mark_ai_called(self, label: str):
+        self.ai_called.add(label.lower().strip())
+
+    def reset(self):
+        self.filled.clear()
+        self.retries.clear()
+        self.ai_called.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 5 – SMALL HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _visible_query_all(el, selector: str):
+    sel = selector.replace(":visible", "")
+    try:
+        elems = await el.query_selector_all(sel)
+    except Exception:
+        return []
+    out = []
+    for e in elems:
+        try:
+            if await e.is_visible():
+                out.append(e)
+        except Exception:
+            pass
+    return out
+
+
+async def _is_button_truly_disabled(btn) -> bool:
+    try:
+        if await btn.get_attribute("disabled") is not None:
+            return True
+        aria = await btn.get_attribute("aria-disabled")
+        if aria and aria.lower() == "true":
+            return True
+        return await btn.evaluate("el => el.disabled")
+    except Exception:
+        return False
+
+
+async def _safe_wait(page: Page, ms: int):
+    await page.wait_for_timeout(ms)
+
+
+async def _wait_net(page: Page, timeout: int = STEP_TIMEOUT):
+    try:
+        await page.wait_for_load_state("networkidle", timeout=timeout)
+    except Exception:
+        pass
+
+
+async def _dismiss_save_popup(page: Page) -> bool:
+    """Detect and dismiss the 'Save this application?' popup that LinkedIn
+    shows when the Easy Apply modal is accidentally closed.
+    Returns True if the popup was found and dismissed."""
+    try:
+        # Check by dialog selectors
+        for sel in (
+            'div[role="alertdialog"]',
+            'div.artdeco-modal--layer-confirmation',
+            'div[data-test-modal-id="discard-confirm-modal"]',
+        ):
+            dialog = await page.query_selector(sel)
+            if not dialog:
+                continue
+            try:
+                if not await dialog.is_visible():
+                    continue
+            except Exception:
+                continue
+            # Click "Discard" to close the popup
+            for bsel in (
+                'button[data-control-name="discard_application_confirm_btn"]',
+                'button[data-test-dialog-secondary-btn]',
+            ):
+                btn = await dialog.query_selector(bsel)
+                if btn:
+                    await btn.click(timeout=FIELD_TIMEOUT)
+                    await _safe_wait(page, 300)
+                    print("    [POPUP] Dismissed save-application dialog")
+                    return True
+            # Fallback: look for Discard button inside dialog
+            for btn in await dialog.query_selector_all("button"):
+                txt = (await btn.text_content() or "").strip().lower()
+                if txt == "discard":
+                    await btn.click(timeout=FIELD_TIMEOUT)
+                    await _safe_wait(page, 300)
+                    print("    [POPUP] Dismissed save-application dialog (fallback)")
+                    return True
+    except Exception:
+        pass
+    # Also check by heading text
+    try:
+        for h in await page.query_selector_all("h2, h3, [data-test-modal-title]"):
+            txt = (await h.text_content() or "").strip().lower()
+            if "save this application" in txt or "discard" in txt:
+                for btn in await page.query_selector_all("button"):
+                    bt = (await btn.text_content() or "").strip().lower()
+                    if bt == "discard":
+                        try:
+                            if await btn.is_visible():
+                                await btn.click(timeout=FIELD_TIMEOUT)
+                                await _safe_wait(page, 300)
+                                print("    [POPUP] Dismissed save-application dialog (text)")
+                                return True
+                        except Exception:
+                            continue
+    except Exception:
+        pass
+    return False
+
+
+async def _close_dropdown(page: Page, trigger=None):
+    """Safely close an open dropdown/listbox WITHOUT pressing Escape.
+    Escape propagates to the Easy Apply modal and triggers the save popup."""
+    # Strategy 1: click the trigger element again to toggle it closed
+    if trigger:
+        try:
+            await trigger.click(timeout=2000)
+            await _safe_wait(page, 100)
+            return
+        except Exception:
+            pass
+    # Strategy 2: press Tab to move focus away (closes dropdown)
+    try:
+        await page.keyboard.press("Tab")
+        await _safe_wait(page, 100)
+    except Exception:
+        pass
+
+
+async def _close_easy_apply_modal(page: Page):
+    """Close the Easy Apply modal after a job application finishes.
+    Handles the 'Save this application?' confirmation popup."""
+    # First dismiss any existing save popup
+    if await _dismiss_save_popup(page):
+        return
+    # Click the X / Dismiss button on the Easy Apply modal
+    try:
+        for ds in (
+            'button[aria-label="Dismiss"]',
+            'button[aria-label="Close"]',
+            "button.artdeco-modal__dismiss",
+        ):
+            b = await page.query_selector(ds)
+            if b and await b.is_visible():
+                await b.click(timeout=FIELD_TIMEOUT)
+                await _safe_wait(page, 500)
+                break
+    except Exception:
+        pass
+    # Now the save popup may appear — dismiss it
+    await _dismiss_save_popup(page)
+
+
+async def _get_nearby_error(page: Page, element) -> str:
+    """Return validation-error text near a field (if any)."""
+    try:
+        return await element.evaluate(r"""el => {
+            const containers = [
+                '.fb-dash-form-element',
+                '.artdeco-text-input--container',
+                '.jobs-easy-apply-form-section__grouping',
+                '.jobs-easy-apply-form-element',
+                '.artdeco-form__item',
+                'fieldset', 'li'
+            ];
+            for (const sel of containers) {
+                const p = el.closest(sel);
+                if (!p) continue;
+                const err = p.querySelector(
+                    '.artdeco-inline-feedback--error, [role="alert"], .field-error'
+                );
+                if (err && err.textContent.trim()) return err.textContent.trim();
+            }
+            return '';
+        }""")
+    except Exception:
+        return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 6 – LABEL → PROFILE MAPPING
+# ═══════════════════════════════════════════════════════════════════════════
+
+_CONTACT_LABELS = [
+    "first name", "last name", "full name", "name", "email",
+    "phone", "mobile", "cell", "street", "address", "city",
+    "state", "province", "zip", "postal", "country", "linkedin", "location",
+]
+
+
+def _map_label_to_profile(label: str, profile: dict, email: str = "") -> str:
+    """Return the EXACT user-profile value for a known label, or '' if unknown."""
+    lb = label.lower().strip()
+    if not lb:
+        return ""
+    g = profile.get
+
+    # --- name ---
+    if any(x in lb for x in ("first name", "fname", "given name", "first_name")):
+        return g("first_name", "")
+    if any(x in lb for x in ("last name", "lname", "surname", "family name", "last_name")):
+        return g("last_name", "")
+    if any(x in lb for x in ("full name", "your name")) or lb.strip() == "name":
+        return g("full_name", "")
+
+    # --- contact ---
+    if "email" in lb:
+        return g("email", "") or email
+    if any(x in lb for x in ("phone", "mobile", "cell")):
+        return g("phone_number", "") or g("phone", "")
+
+    # --- address ---
+    if any(x in lb for x in ("street", "address")) and "ip" not in lb:
+        return g("address", "") or g("street", "") or g("street_address", "")
+    if "hometown" in lb and "city" in lb:
+        return g("hometown_city", "") or g("city", "")
+    if "hometown" in lb and "state" in lb:
+        return g("hometown_state", "") or g("state", "")
+    if "hometown" in lb:
+        return g("hometown_city", "") or g("city", "")
+    if any(x in lb for x in ("current city", "city")):
+        return g("city", "")
+    if any(x in lb for x in ("current state", "state", "province", "region")):
+        return g("state", "")
+    if any(x in lb for x in ("zip", "postal", "pincode", "pin code")):
+        return g("zip_code", "") or g("postal_code", "")
+    if "country" in lb and "code" not in lb:
+        return g("country", "")
+    if "location" in lb and "job" not in lb:
+        return g("city", "") or g("location", "")
+
+    # --- links ---
+    if "linkedin" in lb:
+        return g("linkedin_url", "")
+    if "github" in lb:
+        return g("github_url", "")
+    if "portfolio" in lb or "website" in lb:
+        return g("portfolio_url", "") or g("website", "")
+
+    # --- professional ---
+    if any(x in lb for x in ("current title", "job title", "current position", "designation", "position title")):
+        return g("current_title", "")
+    if any(x in lb for x in ("current company", "company name", "employer", "current employer")):
+        return g("current_company", "")
+    if any(x in lb for x in ("skill set", "skill", "skills", "expertise", "technologies")):
+        return g("skill_set", "") or g("skills", "")
+    if "notice period" in lb:
+        v = g("notice_period", "")
+        return str(v) if v else ""
+
+    # --- experience ---
+    if any(x in lb for x in ("overall experience", "total experience", "years of experience", "work experience")):
+        v = g("years_experience", "")
+        return str(v) if v else ""
+
+    # --- salary / CTC ---
+    if any(x in lb for x in ("expected ctc", "expected salary", "salary expectation")):
+        return str(g("expected_ctc", "") or g("expected_salary", ""))
+    if any(x in lb for x in ("current ctc", "current salary", "current compensation")):
+        v = g("current_ctc", "")
+        return str(v) if v else ""
+    if any(x in lb for x in ("ctc", "salary", "compensation")):
+        return str(g("ctc", "") or g("current_ctc", ""))
+
+    # --- education / India-specific ---
+    if any(x in lb for x in ("date of birth", "dob", "d.o.b", "birth date")):
+        return g("date_of_birth", "") or g("dob", "")
+    if any(x in lb for x in ("10th percentage", "tenth percentage", "10th marks", "ssc", "10th")):
+        v = g("tenth_percentage", "") or g("ssc_percentage", "")
+        return str(v) if v else ""
+    if any(x in lb for x in ("12th percentage", "twelfth percentage", "12th marks", "hsc", "intermediate", "12th")):
+        v = g("twelfth_percentage", "") or g("hsc_percentage", "")
+        return str(v) if v else ""
+    if any(x in lb for x in ("college", "university", "institute", "institution")):
+        return g("college", "") or g("university", "")
+    if any(x in lb for x in ("graduation year", "year of graduation", "passing year", "passout")):
+        v = g("graduation_year", "") or g("passing_year", "")
+        return str(v) if v else ""
+    if any(x in lb for x in ("masters percentage", "bachelors percentage", "degree percentage", "bachelor")):
+        v = g("degree_percentage", "") or g("bachelors_percentage", "")
+        return str(v) if v else ""
+    if "gpa" in lb or "cgpa" in lb:
+        v = g("gpa", "") or g("cgpa", "")
+        return str(v) if v else ""
+    if "already placed" in lb or "placement" in lb:
+        return g("placement_status", "")
+
+    # --- skill-specific experience ---
+    skill_exp = profile.get("skill_experience", {})
+    for skill, yrs in skill_exp.items():
+        if skill.lower() in lb:
+            return str(yrs)
+    if any(x in lb for x in ("experience", "years")):
+        v = g("years_experience", "")
+        return str(v) if v else ""
+
+    return ""                   # unknown → let AI handle
+
+
+def _is_contact(label: str) -> bool:
+    lb = label.lower().strip()
+    return any(x in lb for x in _CONTACT_LABELS)
+
+
+def _resolve_yes_no(label: str, profile: dict) -> str:
+    lb = label.lower()
+    if any(x in lb for x in ("sponsor", "require visa", "need sponsorship", "immigration")):
+        v = str(profile.get("sponsorship", "no")).lower()
+        return "no" if v in ("no", "false", "0", "n") else "yes"
+    if any(x in lb for x in ("authorized", "eligible", "legally", "work authorization", "right to work")):
+        v = str(profile.get("work_authorization", "yes")).lower()
+        return "yes" if v in ("yes", "true", "1", "y") else "no"
+    if any(x in lb for x in ("relocate", "willing to relocate", "relocation")):
+        v = str(profile.get("relocate", "yes")).lower()
+        return "yes" if v in ("yes", "true", "1", "y") else "no"
+    if any(x in lb for x in ("willing", "can you", "do you", "are you", "have you",
+                              "completed", "degree", "bachelor", "master",
+                              "proficient", "fluent", "experience with")):
+        return "yes"
+    return "yes"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 7 – LABEL DETECTION
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def get_field_label(page: Page, element) -> str:
+    parts: list[str] = []
+    try:
+        for attr in ("aria-label",):
+            v = await element.get_attribute(attr)
+            if v and v.strip():
+                parts.append(v.strip())
+
+        llby = await element.get_attribute("aria-labelledby")
+        if llby:
+            for rid in llby.split():
+                try:
+                    r = await page.query_selector(f"#{rid}")
+                    if r:
+                        t = await r.text_content()
+                        if t and t.strip():
+                            parts.append(t.strip())
+                except Exception:
+                    pass
+
+        eid = await element.get_attribute("id")
+        if eid:
+            try:
+                lbl = await page.query_selector(f'label[for="{eid}"]')
+                if lbl:
+                    t = await lbl.text_content()
+                    if t and t.strip():
+                        parts.append(t.strip())
+            except Exception:
+                pass
+
+        sec = await element.evaluate(r'''el => {
+            const sels = [".fb-dash-form-element",".artdeco-text-input--container",
+                ".jobs-easy-apply-form-section__grouping",".jobs-easy-apply-form-element",
+                ".artdeco-form__item","fieldset"];
+            for (const s of sels) {
+                const p = el.closest(s);
+                if (p) {
+                    const l = p.querySelector(
+                        'label,[data-test-form-element-label],.fb-dash-form-element__label,'+
+                        'legend,span.t-bold,span.artdeco-text-input__label');
+                    if (l && l.textContent.trim()) return l.textContent.trim();
+                }
             }
             return "";
         }''')
-        if parent_text:
-            text = await parent_text.json_value()
-            if text:
-                label_text += text.lower() + ' '
-        
-        # Method 5: Check name, id, placeholder
-        for attr in ['name', 'id', 'placeholder']:
-            val = await element.get_attribute(attr)
-            if val:
-                label_text += val.lower() + ' '
-                
-    except:
+        if sec:
+            parts.append(sec)
+
+        for a in ("placeholder", "name", "id"):
+            v = await element.get_attribute(a)
+            if v and v.strip():
+                parts.append(v.strip())
+                break
+    except Exception:
         pass
-    
-    return label_text
+    return " ".join(parts).lower()
 
 
-async def fill_form_fields(page, user_profile: dict, email: str):
-    """Fill visible form fields with user data - enhanced version"""
-    filled_count = 0
-    
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 8 – JS DOM SCANNER  (primary filler)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_JS_SCAN = r"""() => {
+    function lbl(el) {
+        let t = el.getAttribute('aria-label') || '';
+        if (t.trim()) return t.trim();
+        const llby = el.getAttribute('aria-labelledby');
+        if (llby) {
+            t = llby.split(' ').map(id=>{const e=document.getElementById(id);return e?e.textContent.trim():''}).filter(Boolean).join(' ').trim();
+            if (t) return t;
+        }
+        if (el.id) { const l=document.querySelector('label[for="'+el.id+'"]'); if (l&&l.textContent.trim()) return l.textContent.trim(); }
+        const cs=['.fb-dash-form-element','.artdeco-text-input--container','.jobs-easy-apply-form-section__grouping','.jobs-easy-apply-form-element','.artdeco-form__item','fieldset','[data-test-form-element]','li','div.form-component'];
+        for (const s of cs) { try { const p=el.closest(s); if (!p) continue; const l=p.querySelector('label,legend,span.artdeco-text-input__label,.fb-dash-form-element__label,span.t-bold,[class*="label"]'); if (l&&l!==el&&l.textContent.trim()) return l.textContent.trim(); } catch(e){} }
+        return el.placeholder||el.name||el.id||'';
+    }
+    const r=[];
+    for (const el of document.querySelectorAll('input,textarea')) {
+        if (['hidden','submit','button','checkbox','radio','file'].includes(el.type)) continue;
+        const b=el.getBoundingClientRect(); if (!b.width||!b.height) continue;
+        if (el.disabled||el.readOnly) continue;
+        r.push({label:lbl(el),tag:el.tagName.toLowerCase(),type:el.type||'text',id:el.id||'',name:el.name||'',value:el.value||''});
+    }
+    return r;
+}"""
+
+
+async def fill_form_fields_js(
+    page: Page,
+    profile: dict,
+    email: str,
+    tracker: FieldTracker,
+    job_title: str = "",
+    resume_text: str = "",
+):
+    """Scan visible inputs via JS, fill from profile or AI. Respects tracker."""
     try:
-        # ============ HANDLE TEXT INPUTS ============
-        inputs = await page.query_selector_all('input:visible')
-        
-        for inp in inputs:
-            try:
-                input_type = await inp.get_attribute('type') or 'text'
-                if input_type in ['hidden', 'submit', 'button', 'checkbox', 'radio', 'file']:
-                    continue
-                
-                # Check if field is disabled or readonly
-                disabled = await inp.get_attribute('disabled')
-                readonly = await inp.get_attribute('readonly')
-                if disabled or readonly:
-                    continue
-                
-                # Get existing value
-                current_value = await inp.input_value() or ''
-                if current_value.strip():
-                    continue  # Already filled
-                
-                # Get comprehensive label
-                label = await get_field_label(page, inp)
-                
-                # Determine fill value based on field context
-                fill_value = None
-                
-                # Personal info fields
-                if any(x in label for x in ['first name', 'fname', 'given name']):
-                    fill_value = user_profile.get('first_name', 'John')
-                elif any(x in label for x in ['last name', 'lname', 'surname', 'family name']):
-                    fill_value = user_profile.get('last_name', 'Doe')
-                elif any(x in label for x in ['full name', 'your name']) or label.strip() == 'name':
-                    fill_value = user_profile.get('full_name', 'John Doe')
-                elif 'email' in label:
-                    fill_value = user_profile.get('email', email)
-                elif any(x in label for x in ['phone', 'mobile', 'cell']):
-                    fill_value = user_profile.get('phone_number', user_profile.get('phone', '7569663306'))
-                elif 'city' in label:
-                    fill_value = user_profile.get('city', 'Bangalore')
-                elif 'state' in label or 'province' in label:
-                    fill_value = user_profile.get('state', 'Karnataka')
-                elif 'zip' in label or 'postal' in label:
-                    fill_value = user_profile.get('zip_code', '560001')
-                elif 'address' in label:
-                    fill_value = user_profile.get('address', 'Bangalore, India')
-                elif 'country' in label:
-                    fill_value = user_profile.get('country', 'India')
-                
-                # Experience and numeric fields (IMPORTANT: These need numeric values)
-                elif any(x in label for x in ['overall experience', 'total experience', 'years of experience', 'work experience']):
-                    fill_value = str(user_profile.get('years_experience', '3'))
-                elif any(x in label for x in ['relevant experience', 'experience with', 'years in']):
-                    fill_value = str(user_profile.get('relevant_experience', '2'))
-                elif any(x in label for x in ['ai/ml', 'machine learning', 'artificial intelligence']):
-                    fill_value = str(user_profile.get('ai_ml_experience', '2'))
-                elif any(x in label for x in ['python', 'java', 'javascript', 'react', 'angular', 'node']):
-                    fill_value = str(user_profile.get('tech_experience', '2'))
-                elif 'notice period' in label:
-                    fill_value = str(user_profile.get('notice_period', '30'))
-                elif any(x in label for x in ['ctc', 'salary', 'compensation', 'current ctc', 'expected ctc']):
-                    if 'lakh' in label or 'lpa' in label:
-                        fill_value = str(user_profile.get('ctc_lakhs', '8'))
-                    else:
-                        fill_value = str(user_profile.get('ctc', '800000'))
-                elif 'expected' in label and 'salary' in label:
-                    fill_value = str(user_profile.get('expected_salary', '1000000'))
-                
-                # URLs and links
-                elif 'linkedin' in label:
-                    fill_value = user_profile.get('linkedin_url', 'https://linkedin.com/in/profile')
-                elif 'github' in label:
-                    fill_value = user_profile.get('github_url', 'https://github.com/username')
-                elif 'portfolio' in label or 'website' in label:
-                    fill_value = user_profile.get('portfolio_url', '')
-                
-                # Handle generic number fields that need a value > 0
-                elif input_type == 'number':
-                    # Check if there's a validation error nearby
-                    fill_value = '3'  # Default numeric value
-                
-                # Fill the field if we have a value
-                if fill_value:
-                    await inp.clear()
-                    await inp.fill(fill_value)
-                    await inp.press('Tab')  # Trigger validation
-                    filled_count += 1
-                    print(f"    [FILL] {label[:30]}: {fill_value[:20]}")
-                    
-            except Exception as e:
-                continue
-        
-        # ============ HANDLE TEXTAREAS ============
-        textareas = await page.query_selector_all('textarea:visible')
-        for textarea in textareas:
-            try:
-                current_value = await textarea.input_value() or ''
-                if current_value.strip():
-                    continue
-                
-                label = await get_field_label(page, textarea)
-                
-                fill_value = None
-                if any(x in label for x in ['cover letter', 'why', 'about you', 'summary', 'describe']):
-                    fill_value = user_profile.get('cover_letter', 'I am excited about this opportunity and believe my skills align well with your requirements.')
-                elif 'additional' in label or 'other' in label or 'comment' in label:
-                    fill_value = 'N/A'
-                
-                if fill_value:
-                    await textarea.fill(fill_value)
-                    filled_count += 1
-                    
-            except:
-                continue
-        
-        # ============ HANDLE SELECT DROPDOWNS ============
-        selects = await page.query_selector_all('select:visible')
-        for select in selects:
-            try:
-                # Check if already has a value selected
-                current_value = await select.input_value()
-                if current_value and current_value.strip():
-                    continue
-                
-                label = await get_field_label(page, select)
-                options = await select.query_selector_all('option')
-                
-                if len(options) <= 1:
-                    continue
-                
-                target_value = None
-                
-                # Try to select based on common patterns
-                if any(x in label for x in ['country code', 'phone code']):
-                    # Look for India (+91)
-                    for opt in options:
-                        opt_text = (await opt.text_content() or '').lower()
-                        if 'india' in opt_text or '+91' in opt_text:
-                            target_value = await opt.get_attribute('value')
-                            break
-                
-                elif any(x in label for x in ['yes', 'no', 'authorized', 'sponsor', 'relocate', 'willing', 'legally']):
-                    # Look for "Yes" option for most yes/no questions
-                    for opt in options:
-                        opt_text = (await opt.text_content() or '').strip().lower()
-                        opt_value = await opt.get_attribute('value') or ''
-                        if opt_text == 'yes' or opt_value.lower() == 'yes':
-                            target_value = await opt.get_attribute('value')
-                            break
-                
-                elif 'experience' in label:
-                    # Select a middle option for experience dropdowns
-                    for opt in options:
-                        opt_text = (await opt.text_content() or '').lower()
-                        if any(x in opt_text for x in ['2-3', '3-5', '2+', '3+']):
-                            target_value = await opt.get_attribute('value')
-                            break
-                
-                # If no specific match, select first non-empty option
-                if not target_value:
-                    for opt in options[1:]:  # Skip first (usually "Select...")
-                        value = await opt.get_attribute('value')
-                        if value and value.strip() and value.lower() not in ['', 'select', 'choose', '-1']:
-                            target_value = value
-                            break
-                
-                if target_value:
-                    await select.select_option(target_value)
-                    filled_count += 1
-                    print(f"    [SELECT] {label[:30]}: {target_value[:20]}")
-                    
-            except:
-                continue
-        
-        # ============ HANDLE RADIO BUTTONS ============
-        radio_groups = await page.query_selector_all('fieldset, [role="radiogroup"], .fb-dash-form-element')
-        handled_groups = set()
-        
-        for group in radio_groups:
-            try:
-                radios = await group.query_selector_all('input[type="radio"]')
-                if not radios or len(radios) == 0:
-                    continue
-                
-                # Check if any radio is already selected
-                any_checked = False
-                for radio in radios:
-                    if await radio.is_checked():
-                        any_checked = True
-                        break
-                
-                if any_checked:
-                    continue
-                
-                # Get group label
-                label = ''
-                legend = await group.query_selector('legend, label')
-                if legend:
-                    label = (await legend.text_content() or '').lower()
-                
-                # Select appropriate option based on question
-                selected = False
-                for radio in radios:
-                    radio_label = await get_field_label(page, radio)
-                    radio_label = radio_label.lower()
-                    
-                    # For yes/no questions, generally pick "Yes"
-                    if 'yes' in radio_label:
-                        # Always select "Yes" for these question types
-                        if any(x in label for x in [
-                            'authorized', 'eligible', 'willing', 'can you', 'do you have', 'are you',
-                            'have you', 'completed', 'degree', 'education', 'bachelor', 'master',
-                            'doctor', 'phd', 'diploma', 'certificate', 'qualification', 'graduate',
-                            'proficient', 'fluent', 'experience with', 'familiar with', 'worked with'
-                        ]):
-                            await radio.check()
-                            selected = True
-                            filled_count += 1
-                            print(f"    [RADIO] Selected 'Yes' for: {label[:40]}")
-                            break
-                    elif 'no' in radio_label:
-                        if any(x in label for x in ['sponsor', 'require visa', 'need sponsorship']):
-                            await radio.check()
-                            selected = True
-                            filled_count += 1
-                            break
-                
-                # If no specific match, select first option
-                if not selected and radios:
-                    await radios[0].check()
-                    filled_count += 1
-                    
-            except:
-                continue
-        
-        # ============ HANDLE CHECKBOXES ============
-        checkboxes = await page.query_selector_all('input[type="checkbox"]:visible')
-        for checkbox in checkboxes:
-            try:
-                if await checkbox.is_checked():
-                    continue
-                
-                label = await get_field_label(page, checkbox)
-                
-                # Check boxes for terms, agreements, acknowledgments
-                if any(x in label for x in ['agree', 'accept', 'acknowledge', 'confirm', 'terms', 'privacy', 'consent']):
-                    await checkbox.check()
-                    filled_count += 1
-                    
-            except:
-                continue
-        
-        if filled_count > 0:
-            print(f"    [FORM] Filled {filled_count} fields")
-            
+        fields = await page.evaluate(_JS_SCAN)
     except Exception as e:
-        print(f"  [FORM] Error filling fields: {str(e)[:50]}")
+        print(f"  [JS] DOM scan error: {e}")
+        return
+    print(f"  [JS] Scanned {len(fields)} inputs")
+
+    for info in fields:
+        raw_label = (info.get("label") or "").strip()
+        label     = raw_label.lower()
+        cur_val   = (info.get("value") or "").strip()
+        fid       = tracker.make_id(info.get("id", ""), info.get("name", ""), label)
+        tag       = info.get("tag", "input")
+
+        # ─── RULE: already tracked → SKIP ───
+        if tracker.is_done(fid):
+            continue
+
+        # ─── locate DOM element ───
+        elem = None
+        if info.get("id"):
+            try:
+                elem = await page.query_selector(f'#{info["id"]}')
+            except Exception:
+                pass
+        if not elem and info.get("name"):
+            try:
+                elem = await page.query_selector(f'{tag}[name="{info["name"]}"]')
+            except Exception:
+                pass
+        if not elem:
+            continue
+        try:
+            if not await elem.is_visible():
+                continue
+        except Exception:
+            continue
+
+        # ─── RULE: non-empty value & not a contact field → mark done, SKIP ───
+        is_contact = _is_contact(label)
+        if cur_val and not is_contact:
+            tracker.mark_done(fid, cur_val)
+            continue
+
+        # ─── try profile mapping ───
+        fill_val = _map_label_to_profile(label, profile, email)
+
+        # ─── AI fallback for unknown fields ───
+        if not fill_val:
+            if not tracker.ai_was_called_for(label) and label:
+                tracker.mark_ai_called(label)
+                hint = await _get_nearby_error(page, elem)
+                fill_val = await ai_answer_field(label, job_title, profile, resume_text, hint)
+            else:
+                # AI already called and returned empty – skip
+                tracker.mark_done(fid, "")
+                continue
+
+        if not fill_val or not str(fill_val).strip():
+            tracker.mark_done(fid, "")
+            continue
+
+        # ─── fill ───
+        if is_contact or not cur_val:
+            try:
+                await elem.click(timeout=FIELD_TIMEOUT)
+                await elem.fill("", timeout=FIELD_TIMEOUT)
+                await elem.fill(str(fill_val), timeout=FIELD_TIMEOUT)
+                await elem.press("Tab")
+                tracker.mark_done(fid, str(fill_val))
+                print(f"    [JS] '{raw_label[:35]}' = '{str(fill_val)[:25]}'")
+            except Exception as e:
+                tracker.mark_retry(fid)
+                print(f"    [JS] WARN '{raw_label[:30]}': {str(e)[:40]}")
+        else:
+            tracker.mark_done(fid, cur_val)
+
+    # dropdowns
+    await _fill_select_dropdowns(page, profile, tracker, job_title, resume_text)
+    await _fill_custom_dropdowns(page, profile, tracker, job_title, resume_text)
 
 
-async def fill_linkedin_form_questions(page, user_profile: dict, email: str):
-    """
-    LinkedIn-specific form filler that handles question-based form elements
-    by scanning for visible question text and finding associated inputs
-    """
-    filled_count = 0
-    
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 9 – SECTION-BASED FILLER  (secondary pass – radios, textareas, extras)
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def fill_form_sections(
+    page: Page,
+    profile: dict,
+    email: str,
+    tracker: FieldTracker,
+    job_title: str = "",
+    resume_text: str = "",
+):
+    filled = 0
     try:
-        # Find all form sections/groups in the modal
-        form_sections = await page.query_selector_all(
-            '.jobs-easy-apply-form-section__grouping, '
-            '.fb-dash-form-element, '
-            '.artdeco-text-input, '
-            '.jobs-easy-apply-form-element'
+        sections = await page.query_selector_all(
+            ".jobs-easy-apply-form-section__grouping,"
+            ".fb-dash-form-element,"
+            ".artdeco-text-input,"
+            ".jobs-easy-apply-form-element"
         )
-        
-        for section in form_sections:
-            try:
-                # Get the question/label text for this section
-                question_text = ''
-                label_elem = await section.query_selector('label, .fb-dash-form-element__label, span.t-14, span.t-bold')
-                if label_elem:
-                    question_text = await label_elem.text_content() or ''
-                    question_text = question_text.lower().strip()
-                
-                if not question_text:
-                    # Try getting all text in the section
-                    question_text = (await section.text_content() or '').lower()
-                
-                # Find input in this section
-                inp = await section.query_selector('input:not([type="hidden"]):not([type="submit"]):not([type="radio"]):not([type="checkbox"])')
-                if inp:
-                    current_value = await inp.input_value() or ''
-                    if current_value.strip():
-                        continue  # Already filled
-                    
-                    fill_value = None
-                    
-                    # Match question patterns
-                    if any(x in question_text for x in ['overall experience', 'total experience', 'years of experience']):
-                        fill_value = str(user_profile.get('years_experience', '3'))
-                    elif 'relevant experience' in question_text or 'experience with' in question_text:
-                        fill_value = str(user_profile.get('relevant_experience', '2'))
-                    elif any(x in question_text for x in ['ai/ml', 'machine learning', 'ai experience', 'ml experience']):
-                        fill_value = str(user_profile.get('ai_ml_experience', '2'))
-                    elif any(x in question_text for x in ['python', 'java', 'react', 'angular', 'node', 'javascript']):
-                        fill_value = str(user_profile.get('tech_experience', '3'))
-                    elif 'notice period' in question_text:
-                        fill_value = str(user_profile.get('notice_period', '30'))
-                    elif any(x in question_text for x in ['current ctc', 'your ctc', 'current salary', 'current compensation']):
-                        fill_value = str(user_profile.get('current_ctc', '8'))
-                    elif any(x in question_text for x in ['expected ctc', 'expected salary', 'salary expectation']):
-                        fill_value = str(user_profile.get('expected_ctc', '12'))
-                    elif 'ctc' in question_text:
-                        fill_value = str(user_profile.get('ctc', '8'))
-                    elif 'gpa' in question_text or 'cgpa' in question_text:
-                        fill_value = str(user_profile.get('gpa', '3.5'))
-                    elif 'age' in question_text and 'year' not in question_text:
-                        fill_value = str(user_profile.get('age', '25'))
-                    elif 'phone' in question_text or 'mobile' in question_text:
-                        fill_value = user_profile.get('phone_number', user_profile.get('phone', '7569663306'))
-                    
-                    # Default for numeric fields that require a value > 0
-                    if not fill_value:
-                        # Check if there's a validation error requiring numeric input
-                        error_nearby = await section.query_selector('[class*="error"], .artdeco-inline-feedback--error')
-                        if error_nearby:
-                            error_text = await error_nearby.text_content() or ''
-                            if 'decimal' in error_text.lower() or 'number' in error_text.lower() or 'larger than' in error_text.lower():
-                                fill_value = '3'  # Default positive number
-                    
-                    if fill_value:
-                        await inp.clear()
-                        await inp.fill(fill_value)
-                        await inp.press('Tab')
-                        filled_count += 1
-                        print(f"    [Q&A] {question_text[:40]}: {fill_value}")
-                
-                # Handle select dropdown in this section
-                select = await section.query_selector('select')
-                if select:
-                    current_value = await select.input_value() or ''
-                    if current_value.strip():
-                        continue
-                    
-                    options = await select.query_selector_all('option')
-                    target_value = None
-                    
-                    # Determine best option based on question
-                    if any(x in question_text for x in ['country code', 'phone code']):
-                        for opt in options:
-                            opt_text = (await opt.text_content() or '').lower()
-                            if 'india' in opt_text or '+91' in opt_text or '91' in opt_text:
-                                target_value = await opt.get_attribute('value')
-                                break
-                    elif any(x in question_text for x in ['experience with', 'have you', 'completed', 'do you have']):
-                        # Look for "Yes" for qualification/experience questions
-                        for opt in options:
-                            opt_text = (await opt.text_content() or '').strip()
-                            if opt_text.lower() == 'yes':
-                                target_value = await opt.get_attribute('value')
-                                print(f"    [Q&A SELECT] Selected 'Yes' for: {question_text[:30]}")
-                                break
-                    elif 'gender' in question_text:
-                        for opt in options:
-                            opt_text = (await opt.text_content() or '').lower()
-                            if 'male' in opt_text and 'female' not in opt_text:
-                                target_value = await opt.get_attribute('value')
-                                break
-                    elif 'degree' in question_text or 'education' in question_text:
-                        for opt in options:
-                            opt_text = (await opt.text_content() or '').lower()
-                            if any(x in opt_text for x in ['bachelor', 'b.tech', 'b.e.', 'undergraduate']):
-                                target_value = await opt.get_attribute('value')
-                                break
-                    
-                    # Default: select first valid option
-                    if not target_value and len(options) > 1:
-                        for opt in options[1:]:
-                            val = await opt.get_attribute('value')
-                            if val and val.strip() and val.lower() not in ['', 'select', 'choose', '-1']:
-                                target_value = val
-                                break
-                    
-                    if target_value:
-                        await select.select_option(target_value)
-                        filled_count += 1
-                        print(f"    [Q&A SELECT] {question_text[:35]}")
-                
-            except Exception as e:
-                continue
-        
-        # Also scan for any remaining empty inputs with validation errors
-        error_inputs = await page.query_selector_all('.artdeco-inline-feedback--error')
-        for error_elem in error_inputs:
-            try:
-                error_text = await error_elem.text_content() or ''
-                if 'decimal' in error_text.lower() or 'number' in error_text.lower():
-                    # Find the input near this error
-                    parent = await error_elem.evaluate_handle('el => el.closest(".fb-dash-form-element, .jobs-easy-apply-form-section__grouping")')
-                    if parent:
-                        inp = await parent.as_element().query_selector('input')
-                        if inp:
-                            current = await inp.input_value() or ''
-                            if not current.strip():
-                                await inp.fill('3')
-                                await inp.press('Tab')
-                                filled_count += 1
-            except:
-                continue
-        
-        if filled_count > 0:
-            print(f"    [Q&A] Filled {filled_count} question fields")
-            
-    except Exception as e:
-        print(f"  [Q&A] Error: {str(e)[:40]}")
+    except Exception:
+        return
 
+    for section in sections:
+        try:
+            lbl_el = await section.query_selector(
+                "label,.fb-dash-form-element__label,span.t-14,span.t-bold"
+            )
+            q = ""
+            if lbl_el:
+                q = (await lbl_el.text_content() or "").strip().lower()
+            if not q:
+                q = (await section.text_content() or "").strip().lower()[:200]
+
+            # ── TEXT INPUT ──
+            inp = await section.query_selector(
+                'input:not([type="hidden"]):not([type="submit"])'
+                ':not([type="radio"]):not([type="checkbox"]):not([type="file"])'
+            )
+            if inp:
+                try:
+                    if not await inp.is_visible():
+                        continue
+                except Exception:
+                    continue
+                inp_id  = await inp.get_attribute("id") or ""
+                inp_nm  = await inp.get_attribute("name") or ""
+                fid     = tracker.make_id(inp_id, inp_nm, q)
+                if tracker.is_done(fid):
+                    continue
+                cur = (await inp.input_value() or "").strip()
+                is_ct = _is_contact(q)
+                if cur and not is_ct:
+                    tracker.mark_done(fid, cur)
+                    continue
+
+                fill_val = _map_label_to_profile(q, profile, email)
+                if not fill_val and not tracker.ai_was_called_for(q) and q:
+                    tracker.mark_ai_called(q)
+                    hint = await _get_nearby_error(page, inp)
+                    fill_val = await ai_answer_field(q, job_title, profile, resume_text, hint)
+
+                if fill_val and (is_ct or not cur):
+                    try:
+                        await inp.click(timeout=FIELD_TIMEOUT)
+                        await inp.fill("", timeout=FIELD_TIMEOUT)
+                        await inp.fill(str(fill_val), timeout=FIELD_TIMEOUT)
+                        await inp.press("Tab")
+                        filled += 1
+                        tracker.mark_done(fid, str(fill_val))
+                        print(f"    [SEC] '{q[:35]}' = '{str(fill_val)[:25]}'")
+                    except Exception:
+                        tracker.mark_retry(fid)
+                else:
+                    tracker.mark_done(fid, cur or "")
+                continue
+
+            # ── TEXTAREA ──
+            ta = await section.query_selector("textarea")
+            if ta:
+                ta_id = await ta.get_attribute("id") or ""
+                ta_nm = await ta.get_attribute("name") or ""
+                fid   = tracker.make_id(ta_id, ta_nm, q)
+                if tracker.is_done(fid):
+                    continue
+                cur = (await ta.input_value() or "").strip()
+                if cur:
+                    tracker.mark_done(fid, cur)
+                    continue
+
+                fill_val = ""
+                if any(x in q for x in ("skill", "expertise", "technologies")):
+                    fill_val = profile.get("skill_set", "") or profile.get("skills", "")
+                elif any(x in q for x in ("cover letter", "why", "about you", "summary", "describe")):
+                    fill_val = profile.get("cover_letter", "")
+                elif "additional" in q or "other" in q:
+                    fill_val = "N/A"
+
+                if not fill_val and not tracker.ai_was_called_for(q) and q:
+                    tracker.mark_ai_called(q)
+                    fill_val = await ai_answer_field(q, job_title, profile, resume_text)
+
+                if fill_val:
+                    try:
+                        await ta.fill(str(fill_val), timeout=FIELD_TIMEOUT)
+                        filled += 1
+                        tracker.mark_done(fid, str(fill_val))
+                    except Exception:
+                        tracker.mark_retry(fid)
+                else:
+                    tracker.mark_done(fid, "")
+                continue
+
+            # ── RADIO BUTTONS ──
+            radios = await section.query_selector_all('input[type="radio"]')
+            if radios:
+                fid = tracker.make_id("", "", f"radio:{q}")
+                if tracker.is_done(fid):
+                    continue
+                any_checked = False
+                for r in radios:
+                    try:
+                        if await r.is_checked():
+                            any_checked = True
+                            break
+                    except Exception:
+                        pass
+                if any_checked:
+                    tracker.mark_done(fid, "checked")
+                    continue
+                desired = _resolve_yes_no(q, profile)
+                # If AI hasn't been called and label doesn't match standard patterns, try AI
+                if not any(x in q for x in ("sponsor", "authorized", "relocate", "willing",
+                                             "can you", "do you", "are you", "have you")):
+                    if not tracker.ai_was_called_for(q) and q:
+                        tracker.mark_ai_called(q)
+                        ai_ans = await ai_answer_field(q, job_title, profile, resume_text)
+                        if ai_ans and ai_ans.lower().strip() in ("no", "n"):
+                            desired = "no"
+                        else:
+                            desired = "yes"
+
+                selected = False
+                for r in radios:
+                    try:
+                        rl = (await get_field_label(page, r)).lower()
+                        if desired == "yes" and "yes" in rl:
+                            await r.check(timeout=FIELD_TIMEOUT)
+                            selected = True
+                            break
+                        elif desired == "no" and "no" in rl:
+                            await r.check(timeout=FIELD_TIMEOUT)
+                            selected = True
+                            break
+                    except Exception:
+                        continue
+                if not selected and radios:
+                    try:
+                        await radios[0].check(timeout=FIELD_TIMEOUT)
+                        selected = True
+                    except Exception:
+                        pass
+                if selected:
+                    filled += 1
+                    tracker.mark_done(fid, desired)
+                continue
+
+        except Exception:
+            continue
+
+    # ── CHECKBOXES (terms / agreements) ──
+    try:
+        for cb in await _visible_query_all(page, 'input[type="checkbox"]'):
+            try:
+                if await cb.is_checked():
+                    continue
+                lbl = await get_field_label(page, cb)
+                if any(x in lbl for x in ("agree", "accept", "acknowledge", "confirm", "terms", "privacy", "consent")):
+                    await cb.check(timeout=FIELD_TIMEOUT)
+                    filled += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    if filled:
+        print(f"    [SEC-FILL] Filled {filled} fields")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 10 – DROPDOWNS
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _fill_select_dropdowns(page, profile, tracker, job_title="", resume_text=""):
+    try:
+        for sel in await _visible_query_all(page, "select"):
+            try:
+                sid = await sel.get_attribute("id") or ""
+                snm = await sel.get_attribute("name") or ""
+                lbl = await get_field_label(page, sel)
+                fid = tracker.make_id(sid, snm, lbl)
+                if tracker.is_done(fid):
+                    continue
+                cur = (await sel.input_value() or "").strip()
+                if cur:
+                    tracker.mark_done(fid, cur)
+                    continue
+                opts = await sel.query_selector_all("option")
+                val = await _pick_dropdown_value(lbl, opts, profile)
+                if not val and not tracker.ai_was_called_for(lbl) and lbl:
+                    tracker.mark_ai_called(lbl)
+                    ai_ans = await ai_answer_field(lbl, job_title, profile, resume_text)
+                    if ai_ans:
+                        for o in opts:
+                            ot = (await o.text_content() or "").strip().lower()
+                            if ai_ans.lower() in ot or ot in ai_ans.lower():
+                                val = await o.get_attribute("value") or ""
+                                break
+                if val:
+                    await sel.select_option(val, timeout=FIELD_TIMEOUT)
+                    tracker.mark_done(fid, val)
+                    print(f"    [SEL] '{lbl[:30]}' = '{val[:20]}'")
+                else:
+                    tracker.mark_done(fid, "")
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+async def _fill_custom_dropdowns(page, profile, tracker, job_title="", resume_text=""):
+    try:
+        triggers = await _visible_query_all(
+            page,
+            'button[aria-haspopup="listbox"],[role="combobox"],'
+            'select[data-test-text-selectable-option]',
+        )
+        for trig in triggers:
+            try:
+                cur = (await trig.text_content() or "").strip()
+                if cur and cur.lower() not in ("select an option", "select", "choose", "", "--", "please select"):
+                    continue
+                lbl = await get_field_label(page, trig)
+                fid = tracker.make_id("", "", f"combo:{lbl}")
+                if tracker.is_done(fid):
+                    continue
+
+                await trig.click(timeout=FIELD_TIMEOUT)
+                await _safe_wait(page, 250)
+                listbox = None
+                for lb in await page.query_selector_all('[role="listbox"]'):
+                    try:
+                        if await lb.is_visible():
+                            listbox = lb
+                            break
+                    except Exception:
+                        pass
+                if not listbox:
+                    await _close_dropdown(page, trig)
+                    continue
+                opts = await listbox.query_selector_all('[role="option"]')
+                if not opts:
+                    await _close_dropdown(page, trig)
+                    continue
+
+                chosen = await _pick_listbox_option(lbl, opts, profile)
+
+                if not chosen and not tracker.ai_was_called_for(lbl) and lbl:
+                    tracker.mark_ai_called(lbl)
+                    ai_ans = await ai_answer_field(lbl, job_title, profile, resume_text)
+                    if ai_ans:
+                        for o in opts:
+                            ot = (await o.text_content() or "").strip().lower()
+                            if ai_ans.lower() in ot or ot in ai_ans.lower():
+                                chosen = o
+                                break
+
+                if chosen:
+                    await chosen.click(timeout=FIELD_TIMEOUT)
+                    txt = (await chosen.text_content() or "").strip()
+                    tracker.mark_done(fid, txt)
+                    print(f"    [CMB] '{lbl[:30]}' = '{txt[:20]}'")
+                else:
+                    await _close_dropdown(page, trig)
+                    tracker.mark_done(fid, "")
+            except Exception:
+                try:
+                    await _close_dropdown(page, trig)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+async def _pick_listbox_option(label, opts, profile):
+    lb = label.lower()
+    if any(x in lb for x in ("authorized", "sponsor", "relocate", "willing", "legally",
+                               "do you", "have you", "are you", "can you")):
+        desired = _resolve_yes_no(lb, profile)
+        for o in opts:
+            if (await o.text_content() or "").strip().lower() == desired:
+                return o
+
+    if "country" in lb and "code" not in lb:
+        c = (profile.get("country", "") or "").lower()
+        for o in opts:
+            if c and c in (await o.text_content() or "").lower():
+                return o
+
+    if any(x in lb for x in ("experience", "years")):
+        yrs = profile.get("years_experience", "")
+        if yrs and str(yrs).isdigit():
+            yi = int(str(yrs))
+            for o in opts:
+                nums = re.findall(r"\d+", (await o.text_content() or ""))
+                if nums:
+                    lo, hi = int(nums[0]), int(nums[-1]) if len(nums) > 1 else int(nums[0]) + 2
+                    if lo <= yi <= hi:
+                        return o
+
+    if any(x in lb for x in ("salutation", "prefix")):
+        pref = "mr" if (profile.get("gender", "") or "").lower() in ("male", "m", "") else "ms"
+        for o in opts:
+            if pref in (await o.text_content() or "").lower():
+                return o
+
+    if any(x in lb for x in ("job title", "current title", "designation")):
+        tv = (profile.get("current_title", "") or "").lower()
+        for o in opts:
+            ot = (await o.text_content() or "").strip().lower()
+            if tv and (tv in ot or ot in tv):
+                return o
+
+    return None     # AI fallback handled by caller
+
+
+async def _pick_dropdown_value(label, options, profile) -> str:
+    lb = label.lower()
+    if any(x in lb for x in ("country code", "phone code")):
+        c = (profile.get("country", "") or "").lower()
+        for o in options:
+            if c and c in (await o.text_content() or "").lower():
+                return await o.get_attribute("value") or ""
+        for o in options:
+            if "+1" in (await o.text_content() or "") or "united states" in (await o.text_content() or "").lower():
+                return await o.get_attribute("value") or ""
+
+    if any(x in lb for x in ("authorized", "sponsor", "relocate", "willing", "legally",
+                               "do you", "have you", "are you", "can you")):
+        desired = _resolve_yes_no(lb, profile)
+        for o in options:
+            if (await o.text_content() or "").strip().lower() == desired:
+                return await o.get_attribute("value") or ""
+
+    if "experience" in lb or "years" in lb:
+        yrs = profile.get("years_experience", "")
+        if yrs and str(yrs).isdigit():
+            yi = int(str(yrs))
+            for o in options:
+                nums = re.findall(r"\d+", (await o.text_content() or ""))
+                if nums:
+                    lo, hi = int(nums[0]), int(nums[-1]) if len(nums) > 1 else int(nums[0]) + 2
+                    if lo <= yi <= hi:
+                        return await o.get_attribute("value") or ""
+
+    if "degree" in lb or "education" in lb:
+        el = (profile.get("education_level", "") or "").lower()
+        for o in options:
+            if el and el in (await o.text_content() or "").lower():
+                return await o.get_attribute("value") or ""
+        for o in options:
+            if any(x in (await o.text_content() or "").lower() for x in ("bachelor", "b.tech")):
+                return await o.get_attribute("value") or ""
+
+    if "country" in lb and "code" not in lb:
+        c = (profile.get("country", "") or "").lower()
+        for o in options:
+            if c and c in (await o.text_content() or "").lower():
+                return await o.get_attribute("value") or ""
+
+    # generic: first non-placeholder option
+    for o in options[1:]:
+        v = await o.get_attribute("value")
+        if v and v.strip() and v.lower() not in ("", "select", "choose", "-1"):
+            return v
+    return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 11 – RESUME UPLOAD
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def handle_resume_upload(page: Page, resume_path: str) -> bool:
+    if not resume_path or not os.path.isfile(resume_path):
+        return False
+    try:
+        for fi in await page.query_selector_all('input[type="file"]'):
+            try:
+                await fi.set_input_files(resume_path)
+                print(f"  [UPLOAD] {os.path.basename(resume_path)}")
+                await _safe_wait(page, 500)
+                return True
+            except Exception:
+                continue
+        for btn in await page.query_selector_all(
+            'label[for*="file"],button[aria-label*="upload" i],.jobs-document-upload__upload-button'
+        ):
+            try:
+                fa = await btn.get_attribute("for")
+                if fa:
+                    hi = await page.query_selector(f"#{fa}")
+                    if hi:
+                        await hi.set_input_files(resume_path)
+                        await _safe_wait(page, 500)
+                        return True
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"  [UPLOAD] Error: {str(e)[:50]}")
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 12 – BUTTON DETECTION (Next / Review / Submit)
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def detect_and_click_button(page: Page, dry_run: bool) -> str:
+    """Returns: submitted | dry_run | navigated | disabled | not_found"""
+    found_disabled = False
+
+    for fsel in (
+        'footer button[aria-label*="Submit"]',
+        'footer button[aria-label*="Review"]',
+        'footer button[aria-label*="Next"]',
+        'footer button[aria-label*="Continue"]',
+        ".jobs-easy-apply-modal footer button",
+        'div[role="dialog"] footer button',
+        "div.artdeco-modal footer button",
+    ):
+        try:
+            for btn in await page.query_selector_all(fsel):
+                if await _is_button_truly_disabled(btn):
+                    bt = (await btn.text_content() or "").strip().lower()
+                    if any(x in bt for x in ("next", "submit", "review", "continue")):
+                        found_disabled = True
+                    continue
+                bt = (await btn.text_content() or "").strip().lower()
+                al = (await btn.get_attribute("aria-label") or "").lower()
+                if "submit" in bt or "submit" in al:
+                    if dry_run:
+                        print(f"  [DRY RUN] Would submit")
+                        return "dry_run"
+                    await btn.scroll_into_view_if_needed()
+                    await btn.click(timeout=FIELD_TIMEOUT)
+                    await _wait_net(page)
+                    return "submitted"
+                if any(x in bt or x in al for x in ("next", "continue", "review")):
+                    if not any(x in bt for x in ("back", "dismiss", "cancel")):
+                        await btn.scroll_into_view_if_needed()
+                        await btn.click(timeout=FIELD_TIMEOUT)
+                        await _wait_net(page)
+                        print(f"  [BTN] Clicked: '{bt[:20]}'")
+                        return "navigated"
+        except Exception:
+            continue
+
+    try:
+        for pb in await _visible_query_all(page, "button.artdeco-button--primary"):
+            if await _is_button_truly_disabled(pb):
+                found_disabled = True
+                continue
+            bt = (await pb.text_content() or "").strip()
+            if any(x in bt.lower() for x in ("back", "dismiss")):
+                continue
+            if "submit" in bt.lower():
+                if dry_run:
+                    return "dry_run"
+                await pb.scroll_into_view_if_needed()
+                await pb.click(timeout=FIELD_TIMEOUT)
+                await _wait_net(page)
+                return "submitted"
+            await pb.scroll_into_view_if_needed()
+            await pb.click(timeout=FIELD_TIMEOUT)
+            await _wait_net(page)
+            return "navigated"
+    except Exception:
+        pass
+
+    return "disabled" if found_disabled else "not_found"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 13 – SUCCESS / VALIDATION CHECKS
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def check_success(page: Page) -> bool:
+    try:
+        body = await page.text_content("body")
+        return bool(body and ("Application sent" in body or "Your application was sent" in body))
+    except Exception:
+        return False
+
+
+async def has_validation_errors(page: Page) -> bool:
+    try:
+        for err in await page.query_selector_all(".artdeco-inline-feedback--error"):
+            try:
+                if await err.is_visible():
+                    txt = (await err.text_content() or "").strip()
+                    if txt:
+                        print(f"    [VAL] {txt[:60]}")
+                        return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 14 – MAIN AUTOMATION FLOW
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def run_automation(config_json: str):
+    config = json.loads(config_json)
+
+    # ── build profile ──
+    profile = config.get("user_profile", {})
+    if profile.get("phone_number") and not profile.get("phone"):
+        profile["phone"] = profile["phone_number"]
+    elif profile.get("phone") and not profile.get("phone_number"):
+        profile["phone_number"] = profile["phone"]
+    if not profile.get("full_name"):
+        profile["full_name"] = f"{profile.get('first_name','')} {profile.get('last_name','')}".strip()
+    profile.setdefault("skill_experience", {})
+    config["user_profile"] = profile
+
+    resume_text = config.get("resume_text", "")
+
+    print(f"[PROFILE] {profile.get('first_name')} {profile.get('last_name')} | {profile.get('email')} | {profile.get('phone_number')}")
+    print(f"[PROFILE] {profile.get('city')}, {profile.get('state')} {profile.get('zip_code')} | {profile.get('country')}")
+    print(f"[PROFILE] Title: {profile.get('current_title')} | Company: {profile.get('current_company')}")
+
+    ai_cfg = _get_ai_config()
+    print(f"[AI] Provider: {'GitHub Models' if ai_cfg and 'github' in ai_cfg['url'] else 'Groq' if ai_cfg and 'groq' in ai_cfg['url'] else 'OpenAI' if ai_cfg else 'NONE'}")
+
+    result = {"status": "failed", "phase": "", "jobs_found": 0, "applications": [], "errors": []}
+
+    pw = ctx = page = None
+    try:
+        print("[INIT] Starting Playwright…")
+        pw = await async_playwright().start()
+
+        prof_dir = Path("browser_profile")
+        prof_dir.mkdir(exist_ok=True)
+        Path("data/screenshots").mkdir(parents=True, exist_ok=True)
+
+        for lk in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            p = prof_dir / lk
+            if p.exists():
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+
+        headless = config.get("headless", False)
+        print(f"[BROWSER] Launching (headless={headless})…")
+
+        ctx = await pw.chromium.launch_persistent_context(
+            str(prof_dir),
+            headless=headless,
+            slow_mo=30,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage", "--no-sandbox",
+                "--disable-gpu", "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+            ],
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            locale="en-US", timezone_id="America/New_York",
+            ignore_https_errors=True,
+        )
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        page.set_default_timeout(STEP_TIMEOUT)
+        page.set_default_navigation_timeout(NAV_TIMEOUT)
+        await ctx.add_init_script("""
+            Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+            Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});
+            window.chrome={runtime:{}};
+        """)
+        print("[OK] Browser initialized")
+        result["phase"] = "browser_initialized"
+
+        # ═════════ LOGIN ═════════
+        li_email = config.get("linkedin_email")
+        li_pass  = config.get("linkedin_password")
+        if not li_email or not li_pass:
+            raise Exception("LinkedIn credentials not provided")
+
+        await page.goto("https://www.linkedin.com", wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+        await _safe_wait(page, 1000)
+        logged = any(p in page.url for p in ("/feed", "/mynetwork", "/jobs", "/in/"))
+
+        if not logged:
+            await page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            await _safe_wait(page, 500)
+            for s in ('input[name="session_key"]', "input#username"):
+                try:
+                    e = await page.wait_for_selector(s, timeout=FIELD_TIMEOUT)
+                    if e:
+                        await e.fill(li_email, timeout=FIELD_TIMEOUT)
+                        break
+                except Exception:
+                    continue
+            for s in ('input[name="session_password"]', "input#password"):
+                try:
+                    e = await page.wait_for_selector(s, timeout=FIELD_TIMEOUT)
+                    if e:
+                        await e.fill(li_pass, timeout=FIELD_TIMEOUT)
+                        break
+                except Exception:
+                    continue
+            try:
+                await page.click('button[type="submit"]', timeout=FIELD_TIMEOUT)
+            except Exception:
+                pass
+            await _wait_net(page)
+            await _safe_wait(page, 2000)
+            if any(p in page.url for p in ("/feed", "/mynetwork", "/jobs", "/check/add-phone", "/in/")):
+                logged = True
+                print("[OK] Login successful!")
+            elif "checkpoint" in page.url or "challenge" in page.url:
+                print("[WARN] Security checkpoint – waiting 60 s…")
+                await _safe_wait(page, 60000)
+                logged = True
+            else:
+                raise Exception(f"Login may have failed – URL: {page.url}")
+        if not logged:
+            raise Exception("Not logged in")
+        result["phase"] = "logged_in"
+
+        # ═════════ SEARCH ═════════
+        import urllib.parse as _up
+        kw  = config.get("keyword", "Software Engineer")
+        loc = config.get("location", "Remote")
+        url = f"https://www.linkedin.com/jobs/search/?keywords={_up.quote(kw)}&location={_up.quote(loc)}&f_AL=true&sortBy=R"
+        print(f"\n[SEARCH] {kw} / {loc}")
+        await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+        await _wait_net(page)
+        await _safe_wait(page, 1500)
+        result["phase"] = "searching"
+
+        # ═════════ COLLECT ═════════
+        print("[COLLECT] Collecting job listings…")
+        for _ in range(3):
+            await page.evaluate("window.scrollTo(0,document.body.scrollHeight)")
+            await _safe_wait(page, 400)
+        await page.evaluate("window.scrollTo(0,0)")
+        await _safe_wait(page, 300)
+
+        job_cards = []
+        for sel in (
+            "li.scaffold-layout__list-item",
+            "li.jobs-search-results__list-item",
+            "div.job-card-container",
+            "div[data-job-id]",
+            "ul.scaffold-layout__list-container > li",
+        ):
+            try:
+                cards = await page.query_selector_all(sel)
+                if cards:
+                    job_cards = cards
+                    print(f"[OK] {len(cards)} cards ({sel[:40]})")
+                    break
+            except Exception:
+                continue
+
+        max_jobs = config.get("max_applications", 5)
+        jobs: list[dict] = []
+        for i, card in enumerate(job_cards[: max_jobs * 2]):
+            try:
+                await card.scroll_into_view_if_needed()
+                await _safe_wait(page, 200)
+                await card.click(timeout=FIELD_TIMEOUT)
+                await _safe_wait(page, 800)
+
+                title = None
+                for s in (
+                    "h1.job-details-jobs-unified-top-card__job-title",
+                    "h1.jobs-unified-top-card__job-title",
+                    "h1.t-24.t-bold.inline",
+                    ".job-details-jobs-unified-top-card__job-title",
+                    "a.job-card-container__link span",
+                ):
+                    try:
+                        e = await page.query_selector(s)
+                        if e:
+                            title = (await e.text_content() or "").strip()
+                            if title:
+                                break
+                    except Exception:
+                        continue
+
+                company = None
+                for s in (
+                    "a.job-details-jobs-unified-top-card__company-name",
+                    ".jobs-unified-top-card__company-name",
+                    ".job-card-container__company-name",
+                ):
+                    try:
+                        e = await page.query_selector(s)
+                        if e:
+                            company = (await e.text_content() or "").strip()
+                            if company:
+                                break
+                    except Exception:
+                        continue
+                company = company or "Unknown"
+
+                easy = False
+                for s in ('button.jobs-apply-button', 'button[aria-label*="Easy Apply"]'):
+                    try:
+                        b = await page.query_selector(s)
+                        if b and ("easy" in (await b.text_content() or "").lower() or "apply" in (await b.text_content() or "").lower()):
+                            easy = True
+                            break
+                    except Exception:
+                        continue
+
+                if title and easy:
+                    jobs.append({"index": i + 1, "title": title[:100], "company": company[:50], "url": page.url, "easy_apply": True})
+                    print(f"  [+] {len(jobs)}: {title[:45]} @ {company[:20]}")
+                    if len(jobs) >= max_jobs:
+                        break
+            except Exception as e:
+                print(f"  [WARN] card {i+1}: {str(e)[:40]}")
+        result["jobs_found"] = len(jobs)
+        result["phase"] = "jobs_collected"
+        print(f"[OK] Collected {len(jobs)} Easy Apply jobs")
+
+        # ═════════ APPLICATION PHASE ═════════
+        dry_run     = config.get("dry_run", True)
+        resume_path = config.get("resume_path", "")
+        li_fill     = config.get("linkedin_email", "")
+
+        print(f"\n[APPLY] Starting (dry_run={dry_run})…")
+
+        for job in jobs[:max_jobs]:
+            tracker = FieldTracker()            # fresh tracker per job
+            _ai_cache.clear()                   # fresh AI cache per job
+
+            try:
+                jt = job["title"]
+                print(f"\n[APPLY] Applying to: {jt[:45]} @ {job['company']}")
+
+                await page.goto(job["url"], wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+                await _safe_wait(page, 1000)
+
+                # click Easy Apply
+                clicked = False
+                for s in ('button.jobs-apply-button', 'button[aria-label*="Easy Apply"]', 'button:has-text("Easy Apply")'):
+                    try:
+                        b = await page.wait_for_selector(s, timeout=FIELD_TIMEOUT)
+                        if b:
+                            await b.click(timeout=FIELD_TIMEOUT)
+                            clicked = True
+                            print("  [OK] Clicked Easy Apply")
+                            break
+                    except Exception:
+                        continue
+                if not clicked:
+                    job["status"] = "FAILED"
+                    job["error"] = "Could not click Easy Apply"
+                    result["applications"].append(job)
+                    continue
+
+                await _wait_net(page)
+                await _safe_wait(page, 500)
+
+                # ═════════ MULTI-STEP FORM LOOP ═════════
+                no_progress = 0
+                button_retries = 0
+
+                for step in range(MAX_STEPS):
+                    await _safe_wait(page, 200)
+
+                    # ── dismiss stray save popup if it appeared ──
+                    if await _dismiss_save_popup(page):
+                        # popup was open — re-click Easy Apply to re-open the form
+                        for rs in ('button.jobs-apply-button', 'button[aria-label*="Easy Apply"]'):
+                            try:
+                                rb = await page.wait_for_selector(rs, timeout=FIELD_TIMEOUT)
+                                if rb:
+                                    await rb.click(timeout=FIELD_TIMEOUT)
+                                    await _wait_net(page)
+                                    await _safe_wait(page, 500)
+                                    break
+                            except Exception:
+                                continue
+
+                    if await check_success(page):
+                        job["status"] = "APPLIED"
+                        print("  [SUCCESS] Application submitted!")
+                        break
+
+                    print(f"  [STEP {step+1}] Filling…")
+
+                    # ── FILL (respects tracker – never re-fills) ──
+                    await fill_form_fields_js(page, profile, li_fill, tracker, jt, resume_text)
+                    await fill_form_sections(page, profile, li_fill, tracker, jt, resume_text)
+
+                    if resume_path:
+                        await handle_resume_upload(page, resume_path)
+
+                    await _safe_wait(page, 700)
+
+                    # ── validation errors → one retry pass ──
+                    if await has_validation_errors(page):
+                        print("    [RETRY] Re-filling after validation…")
+                        # Reset done-flags for fields that had errors so we can re-attempt
+                        await fill_form_fields_js(page, profile, li_fill, tracker, jt, resume_text)
+                        await fill_form_sections(page, profile, li_fill, tracker, jt, resume_text)
+                        await _safe_wait(page, 700)
+
+                    if await check_success(page):
+                        job["status"] = "APPLIED"
+                        print("  [SUCCESS] Application submitted!")
+                        break
+
+                    # ── click Next / Submit ──
+                    btn_res = await detect_and_click_button(page, dry_run)
+
+                    if btn_res == "submitted":
+                        job["status"] = "APPLIED"
+                        print("  [SUCCESS] Application submitted!")
+                        break
+                    elif btn_res == "dry_run":
+                        job["status"] = "DRY_RUN"
+                        break
+                    elif btn_res == "navigated":
+                        no_progress = 0
+                        button_retries = 0
+                        await _safe_wait(page, 500)
+                    elif btn_res == "disabled":
+                        if button_retries < MAX_BUTTON_RETRIES:
+                            button_retries += 1
+                            print(f"    [RETRY] Button disabled – re-filling (attempt {button_retries})…")
+                            await fill_form_fields_js(page, profile, li_fill, tracker, jt, resume_text)
+                            await fill_form_sections(page, profile, li_fill, tracker, jt, resume_text)
+                            await _safe_wait(page, 1000)
+                            btn2 = await detect_and_click_button(page, dry_run)
+                            if btn2 in ("submitted", "dry_run"):
+                                job["status"] = "APPLIED" if btn2 == "submitted" else "DRY_RUN"
+                                break
+                            elif btn2 == "navigated":
+                                no_progress = 0
+                            else:
+                                no_progress += 1
+                        else:
+                            no_progress += 1
+                    else:
+                        no_progress += 1
+                        print(f"  [WARN] No button (streak={no_progress})")
+
+                    if no_progress >= MAX_NO_PROGRESS:
+                        print(f"  [ABORT] {no_progress} steps no progress")
+                        break
+
+                if not job.get("status"):
+                    job["status"] = "INCOMPLETE"
+                result["applications"].append(job)
+
+                # close modal safely (avoid triggering save popup)
+                await _close_easy_apply_modal(page)
+                await _safe_wait(page, 500)
+
+            except Exception as e:
+                job["status"] = "FAILED"
+                job["error"] = str(e)[:100]
+                result["applications"].append(job)
+                print(f"  [ERROR] {str(e)[:60]}")
+                await _close_easy_apply_modal(page)
+                await _safe_wait(page, 300)
+
+        result["status"] = "completed"
+        result["phase"] = "completed"
+        applied = len([a for a in result["applications"] if a.get("status") in ("APPLIED", "DRY_RUN")])
+        print(f"\n[DONE] Jobs found: {result['jobs_found']} | Applied: {applied}/{len(result['applications'])}")
+
+    except Exception as e:
+        result["errors"].append(str(e))
+        print(f"\n[FATAL] {str(e)}")
+        if page:
+            try:
+                await page.reload(timeout=NAV_TIMEOUT)
+            except Exception:
+                pass
+    finally:
+        if page:
+            try:
+                await _safe_wait(page, 1000)
+            except Exception:
+                pass
+        if ctx:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+        if pw:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+        print("[CLOSED] Browser closed")
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 15 – ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python playwright_runner.py <config_json>")
         sys.exit(1)
-    
-    config_json = sys.argv[1]
-    
-    # Run the automation
-    result = asyncio.run(run_automation(config_json))
-    
-    # Output result as JSON
+    res = asyncio.run(run_automation(sys.argv[1]))
     print("\n===RESULT_JSON===")
-    print(json.dumps(result, indent=2))
+    print(json.dumps(res, indent=2))

@@ -1776,6 +1776,32 @@ Return this exact JSON structure:
                     try:
                         btn = await modal.query_selector(selector)
                         if btn and await btn.is_visible():
+                            # Check if button is truly disabled (disabled attr, aria-disabled, or DOM property)
+                            is_disabled = False
+                            try:
+                                disabled_attr = await btn.get_attribute('disabled')
+                                if disabled_attr is not None:
+                                    is_disabled = True
+                                aria_disabled = await btn.get_attribute('aria-disabled')
+                                if aria_disabled and aria_disabled.lower() == 'true':
+                                    is_disabled = True
+                                if not is_disabled:
+                                    is_disabled_prop = await btn.evaluate('el => el.disabled')
+                                    if is_disabled_prop:
+                                        is_disabled = True
+                            except:
+                                pass
+                            
+                            if is_disabled:
+                                try:
+                                    dbg_text = (await btn.inner_text() or "").strip()
+                                except:
+                                    dbg_text = ""
+                                print(f"  ⚠️  Button '{dbg_text[:25]}' is disabled — required fields may be missing")
+                                errors.append("primary_button_disabled")
+                                # Don't break — try other selectors in case there's an enabled one
+                                continue
+                            
                             primary_btn = btn
                             try:
                                 btn_text = (await btn.inner_text() or "").strip().lower()
@@ -1789,7 +1815,7 @@ Return this exact JSON structure:
                     print("⚠️  No primary button found in modal")
                     return {
                         "status": "NEEDS_REVIEW",
-                        "reason": "Could not find Next/Submit button",
+                        "reason": "Could not find Next/Submit button (button may be disabled due to missing required fields)",
                         "steps": steps,
                         "errors": errors + ["no_button_found"],
                     }
@@ -1850,13 +1876,6 @@ Return this exact JSON structure:
                 await asyncio.sleep(1.5)
                 print(f"   ✅ Clicked {action_name}, moving to next step...")
                 continue
-
-            return {
-                "status": "NEEDS_REVIEW",
-                "reason": "Max steps exceeded",
-                "steps": steps,
-                "errors": errors + ["max_steps"],
-            }
 
             return {
                 "status": "NEEDS_REVIEW",
@@ -2517,13 +2536,7 @@ Provide a professional 2-3 sentence answer:"""
                     if is_disabled is not None or is_readonly is not None:
                         continue
                     
-                    # Check if already filled - skip if has value
-                    current_value = await input_field.input_value()
-                    if current_value and len(current_value.strip()) > 2:
-                        print(f"  ⏩ Skipping already filled field: '{current_value[:30]}...'")
-                        continue
-                    
-                    # Get field identifiers
+                    # Get field identifiers FIRST (needed for override logic)
                     field_name = await input_field.get_attribute('name') or ''
                     field_id = await input_field.get_attribute('id') or ''
                     field_placeholder = await input_field.get_attribute('placeholder') or ''
@@ -2556,7 +2569,39 @@ Provide a professional 2-3 sentence answer:"""
                     # Combine all identifiers for smart matching
                     field_identifier = f"{field_name} {field_id} {field_placeholder} {field_aria_label} {label_text}".lower()
                     
-                    print(f"  🔍 Field detected: type={field_type}, identifier='{field_identifier[:60]}...'")
+                    # Determine if this is a contact/identity field that should ALWAYS be overridden
+                    # (corrects corrupted data from previous bad runs)
+                    is_override_field = False
+                    if any(kw in field_identifier for kw in ['first name', 'firstname', 'fname', 'given name']):
+                        is_override_field = True
+                    elif any(kw in field_identifier for kw in ['last name', 'lastname', 'lname', 'surname', 'family name']):
+                        is_override_field = True
+                    elif any(kw in field_identifier for kw in ['full name', 'legal name']) or field_identifier.strip() == 'name':
+                        is_override_field = True
+                    elif 'email' in field_identifier:
+                        is_override_field = True
+                    elif any(kw in field_identifier for kw in ['phone', 'mobile', 'cell']) or field_type == 'tel':
+                        is_override_field = True
+                    elif any(kw in field_identifier for kw in ['city', 'location (city)']):
+                        is_override_field = True
+                    elif any(kw in field_identifier for kw in ['state', 'province']):
+                        is_override_field = True
+                    elif any(kw in field_identifier for kw in ['zip', 'postal', 'pincode', 'pin code']):
+                        is_override_field = True
+                    elif any(kw in field_identifier for kw in ['street', 'address']):
+                        is_override_field = True
+                    elif 'country' in field_identifier:
+                        is_override_field = True
+                    elif 'location' in field_identifier and 'job' not in field_identifier:
+                        is_override_field = True
+                    
+                    # Check if already filled - skip ONLY non-override fields
+                    current_value = await input_field.input_value()
+                    if current_value and len(current_value.strip()) > 2 and not is_override_field:
+                        print(f"  ⏩ Skipping already filled field: '{current_value[:30]}...'")
+                        continue
+                    
+                    print(f"  🔍 Field detected: type={field_type}, identifier='{field_identifier[:60]}...'{' [OVERRIDE]' if is_override_field else ''}")
                     
                     # Get appropriate value using smart matching
                     value = self._get_field_value_smart(field_identifier, 'text', self.user_profile)
@@ -2726,6 +2771,99 @@ Provide a professional 2-3 sentence answer:"""
                             print(f"     👁️  Look at browser to see dropdown selection!")
                 except Exception as e:
                     print(f"  ⚠️  Could not select dropdown: {str(e)[:50]}")
+            
+            # Handle LinkedIn custom dropdowns (button[aria-haspopup="listbox"], [role="combobox"])
+            print(f"\n🔽 Processing LinkedIn custom dropdowns...")
+            custom_triggers = await modal.query_selector_all(
+                'button[aria-haspopup="listbox"], '
+                '[role="combobox"]:not(input), '
+                'div[data-test-text-selectable-option], '
+                '.artdeco-dropdown__trigger'
+            )
+            for trigger in custom_triggers:
+                try:
+                    if not await trigger.is_visible():
+                        continue
+                    
+                    # Check if already has a selection
+                    current_text = (await trigger.text_content() or '').strip()
+                    if current_text and current_text.lower() not in ['select an option', 'select', 'choose', '', '--']:
+                        print(f"  ⏩ Custom dropdown already set: '{current_text[:30]}'")
+                        continue
+                    
+                    # Get parent section label
+                    label_text = ''
+                    try:
+                        parent_section = await trigger.evaluate_handle(
+                            'el => el.closest(".fb-dash-form-element, .jobs-easy-apply-form-section__grouping, fieldset")'
+                        )
+                        if parent_section:
+                            label_elem = await parent_section.as_element().query_selector(
+                                'label, .fb-dash-form-element__label, legend, span.t-bold'
+                            )
+                            if label_elem:
+                                label_text = (await label_elem.text_content() or '').lower().strip()
+                    except:
+                        pass
+                    
+                    # Click trigger to open listbox
+                    await trigger.click()
+                    await asyncio.sleep(0.4)
+                    
+                    # Find visible listbox
+                    listbox = None
+                    listbox_candidates = await self.page.query_selector_all('[role="listbox"]')
+                    for lb in listbox_candidates:
+                        try:
+                            if await lb.is_visible():
+                                listbox = lb
+                                break
+                        except:
+                            pass
+                    
+                    if not listbox:
+                        await self.page.keyboard.press('Escape')
+                        continue
+                    
+                    option_elems = await listbox.query_selector_all('[role="option"]')
+                    if not option_elems:
+                        await self.page.keyboard.press('Escape')
+                        continue
+                    
+                    # Try smart matching via _get_field_value_smart
+                    desired = self._get_field_value_smart(label_text, 'select', self.user_profile)
+                    
+                    chosen = None
+                    if desired:
+                        desired_lower = desired.lower()
+                        for opt_elem in option_elems:
+                            opt_text = (await opt_elem.text_content() or '').strip().lower()
+                            if opt_text == desired_lower or desired_lower in opt_text:
+                                chosen = opt_elem
+                                break
+                    
+                    # Fallback: pick first non-placeholder option
+                    if not chosen and option_elems:
+                        for opt_elem in option_elems:
+                            opt_text = (await opt_elem.text_content() or '').strip().lower()
+                            if opt_text not in ['select an option', 'select', 'choose', '', '--']:
+                                chosen = opt_elem
+                                break
+                    
+                    if chosen:
+                        await chosen.click()
+                        filled_count += 1
+                        opt_text = (await chosen.text_content() or '').strip()
+                        print(f"  ✅ Custom dropdown: '{label_text[:40]}' → '{opt_text[:30]}'")
+                    else:
+                        await self.page.keyboard.press('Escape')
+                        print(f"  ⚠️  No matching option for custom dropdown: '{label_text[:40]}'")
+                except Exception as e:
+                    try:
+                        await self.page.keyboard.press('Escape')
+                    except:
+                        pass
+                    print(f"  ⚠️  Could not handle custom dropdown: {str(e)[:50]}")
             
             # Handle radio buttons (modal-specific) - Yes for work authorization, No for sponsorship
             radios = await modal.query_selector_all('input[type="radio"]')

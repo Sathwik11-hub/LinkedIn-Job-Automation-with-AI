@@ -40,14 +40,22 @@ from backend.database.crud import (
     AnalyticsRepository
 )
 
-# Vector Store
-from backend.database.vector_store import (
-    VectorStoreManager,
-    vector_store,
-    get_embedding,
-    calculate_job_match_score,
-    find_matching_jobs
-)
+# Vector Store (optional - torch may not be compatible with current Python version)
+try:
+    from backend.database.vector_store import (
+        VectorStoreManager,
+        vector_store,
+        get_embedding,
+        calculate_job_match_score,
+        find_matching_jobs
+    )
+except Exception as _vs_err:
+    print(f"⚠️ Vector store unavailable: {_vs_err}")
+    VectorStoreManager = None
+    vector_store = None
+    get_embedding = None
+    calculate_job_match_score = None
+    find_matching_jobs = None
 
 # File Storage
 from backend.database.file_storage import (

@@ -28,8 +28,8 @@ try:
     from sentence_transformers import SentenceTransformer as _SentenceTransformer
     SentenceTransformer = _SentenceTransformer
     SENTENCE_TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    print("⚠️ sentence-transformers not installed. Using fallback embedding.")
+except Exception:
+    print("⚠️ sentence-transformers/torch not available on this Python version. Using fallback embedding.")
 
 
 class VectorStoreManager:

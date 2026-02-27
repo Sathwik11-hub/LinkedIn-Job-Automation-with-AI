@@ -1,0 +1,2037 @@
+"""
+Playwright runner script - runs separately from uvicorn to avoid event loop conflicts
+Optimized for LinkedIn's current UI
+"""
+import asyncio
+import sys
+import json
+import random
+import time
+import os
+from pathlib import Path
+from datetime import datetime
+
+# Set UTF-8 encoding for stdout/stderr on Windows
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+from playwright.async_api import async_playwright
+
+
+async def _visible_query_all(page_or_elem, selector: str):
+    """Replacement for query_selector_all('...:visible').
+    Playwright's query_selector_all does NOT support the :visible pseudo-selector.
+    This helper queries without :visible, then filters to only visible elements.
+    """
+    # Strip :visible from the selector — it's a Playwright locator feature, not CSS
+    clean_selector = selector.replace(':visible', '')
+    elements = await page_or_elem.query_selector_all(clean_selector)
+    visible = []
+    for el in elements:
+        try:
+            if await el.is_visible():
+                visible.append(el)
+        except:
+            pass
+    return visible
+
+
+async def _is_button_truly_disabled(btn) -> bool:
+    """Check if a button is disabled via attribute, property, or aria-disabled."""
+    try:
+        # Check HTML disabled attribute
+        disabled_attr = await btn.get_attribute('disabled')
+        if disabled_attr is not None:
+            return True
+        # Check aria-disabled (LinkedIn uses this extensively)
+        aria_disabled = await btn.get_attribute('aria-disabled')
+        if aria_disabled and aria_disabled.lower() == 'true':
+            return True
+        # Check the DOM property (covers cases where attribute is absent but property is set)
+        is_disabled_prop = await btn.evaluate('el => el.disabled')
+        if is_disabled_prop:
+            return True
+    except:
+        pass
+    return False
+
+
+async def run_automation(config_json: str):
+    """Run the full LinkedIn automation flow"""
+    config = json.loads(config_json)
+    
+    # Use ONLY user-provided profile — no hardcoded fallbacks
+    user_profile = config.get('user_profile', {})
+    
+    # Ensure both phone keys are synced (frontend sends phone_number)
+    if user_profile.get('phone_number') and not user_profile.get('phone'):
+        user_profile['phone'] = user_profile['phone_number']
+    elif user_profile.get('phone') and not user_profile.get('phone_number'):
+        user_profile['phone_number'] = user_profile['phone']
+    
+    # Build full_name if missing
+    if not user_profile.get('full_name'):
+        user_profile['full_name'] = f"{user_profile.get('first_name', '')} {user_profile.get('last_name', '')}".strip()
+
+    # Build skill_experience map from parsed resume data if available
+    user_profile.setdefault('skill_experience', {})
+    
+    config['user_profile'] = user_profile
+    
+    result = {
+        "status": "failed",
+        "phase": "",
+        "jobs_found": 0,
+        "applications": [],
+        "errors": []
+    }
+    
+    playwright = None
+    context = None
+    page = None
+    
+    try:
+        print("[INIT] Starting Playwright automation...")
+        playwright = await async_playwright().start()
+        
+        # Profile directory
+        profile_dir = Path("browser_profile")
+        profile_dir.mkdir(exist_ok=True)
+        
+        # Screenshots directory
+        screenshots_dir = Path("data/screenshots")
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Clean up lock files
+        for lock_name in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
+            lock_file = profile_dir / lock_name
+            if lock_file.exists():
+                try:
+                    lock_file.unlink()
+                except:
+                    pass
+        
+        headless = config.get('headless', False)
+        
+        print(f"[BROWSER] Launching browser (headless={headless})...")
+        print(f"[BROWSER] Profile: {profile_dir.absolute()}")
+        
+        context = await playwright.chromium.launch_persistent_context(
+            str(profile_dir),
+            headless=headless,
+            slow_mo=30,  # Fast but stable
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+                '--disable-gpu',
+                '--disable-web-security',
+                '--disable-features=IsolateOrigins,site-per-process',
+            ],
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            locale='en-US',
+            timezone_id='America/New_York',
+            ignore_https_errors=True,
+        )
+        
+        if len(context.pages) > 0:
+            page = context.pages[0]
+        else:
+            page = await context.new_page()
+        
+        page.set_default_timeout(60000)
+        page.set_default_navigation_timeout(60000)
+        
+        # Anti-detection
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            window.chrome = {runtime: {}};
+        """)
+        
+        print("[OK] Browser initialized successfully")
+        result["phase"] = "browser_initialized"
+        
+        # Save screenshot
+        await page.screenshot(path=str(screenshots_dir / "01_browser_init.png"))
+        
+        # ============ LOGIN PHASE ============
+        print("\n[LOGIN] Starting LinkedIn login...")
+        email = config.get('linkedin_email')
+        password = config.get('linkedin_password')
+        
+        if not email or not password:
+            raise Exception("LinkedIn credentials not provided")
+        
+        await page.goto('https://www.linkedin.com', wait_until='domcontentloaded', timeout=30000)
+        await asyncio.sleep(1)
+        
+        current_url = page.url
+        print(f"[DEBUG] Current URL: {current_url}")
+        
+        # Check if already logged in
+        logged_in = False
+        if any(path in current_url for path in ['/feed', '/mynetwork', '/jobs', '/in/']):
+            logged_in = True
+            print("[OK] Already logged in to LinkedIn")
+        else:
+            # Navigate to login page
+            await page.goto('https://www.linkedin.com/login', wait_until='domcontentloaded', timeout=30000)
+            await asyncio.sleep(0.5)
+            
+            await page.screenshot(path=str(screenshots_dir / "02_login_page.png"))
+            
+            # Fill credentials
+            print(f"[LOGIN] Entering credentials for: {email[:5]}***")
+            
+            try:
+                # Try multiple selectors for email field
+                email_filled = False
+                for sel in ['input[name="session_key"]', 'input#username', 'input[autocomplete="username"]']:
+                    try:
+                        elem = await page.query_selector(sel)
+                        if elem:
+                            await elem.fill(email)
+                            email_filled = True
+                            print(f"[DEBUG] Email filled using: {sel}")
+                            break
+                    except:
+                        continue
+                
+                if not email_filled:
+                    raise Exception("Could not find email input field")
+                
+                await asyncio.sleep(0.2)
+                
+                # Fill password
+                password_filled = False
+                for sel in ['input[name="session_password"]', 'input#password', 'input[type="password"]']:
+                    try:
+                        elem = await page.query_selector(sel)
+                        if elem:
+                            await elem.fill(password)
+                            password_filled = True
+                            print(f"[DEBUG] Password filled using: {sel}")
+                            break
+                    except:
+                        continue
+                
+                if not password_filled:
+                    raise Exception("Could not find password input field")
+                
+                await asyncio.sleep(0.2)
+                
+                # Click submit
+                await page.click('button[type="submit"]')
+                print("[LOGIN] Submitted login form")
+                
+                await asyncio.sleep(2.5)
+                
+                current_url = page.url
+                print(f"[DEBUG] URL after login: {current_url}")
+                
+                await page.screenshot(path=str(screenshots_dir / "03_after_login.png"))
+                
+                if any(path in current_url for path in ['/feed', '/mynetwork', '/jobs', '/check/add-phone', '/in/']):
+                    logged_in = True
+                    print("[OK] Login successful!")
+                elif 'checkpoint' in current_url or 'challenge' in current_url:
+                    print("[WARN] Security checkpoint detected - waiting 60 seconds...")
+                    await asyncio.sleep(60)
+                    logged_in = True
+                else:
+                    raise Exception(f"Login may have failed - URL: {current_url}")
+                    
+            except Exception as e:
+                print(f"[ERROR] Login failed: {str(e)}")
+                result["errors"].append(f"Login error: {str(e)}")
+                raise
+        
+        if not logged_in:
+            raise Exception("Not logged in to LinkedIn")
+        
+        result["phase"] = "logged_in"
+        
+        # ============ JOB SEARCH PHASE ============
+        print("\n[SEARCH] Starting job search...")
+        
+        import urllib.parse
+        keyword = config.get('keyword', 'Software Engineer')
+        location = config.get('location', 'Remote')
+        
+        # Build search URL with Easy Apply filter
+        search_url = f'https://www.linkedin.com/jobs/search/?keywords={urllib.parse.quote(keyword)}&location={urllib.parse.quote(location)}&f_AL=true&sortBy=R'
+        
+        print(f"[SEARCH] Keyword: {keyword}")
+        print(f"[SEARCH] Location: {location}")
+        print(f"[SEARCH] URL: {search_url}")
+        
+        await page.goto(search_url, wait_until='domcontentloaded', timeout=60000)
+        await asyncio.sleep(2)
+        
+        await page.screenshot(path=str(screenshots_dir / "04_job_search.png"))
+        
+        result["phase"] = "searching"
+        
+        # ============ JOB COLLECTION PHASE ============
+        print("\n[COLLECT] Collecting job listings...")
+        
+        # Wait for job list to load
+        await asyncio.sleep(1.5)
+        
+        # Scroll to load more jobs
+        for i in range(3):
+            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+            await asyncio.sleep(0.4)
+            print(f"[SCROLL] Scroll {i+1}/3")
+        
+        # Scroll back to top
+        await page.evaluate('window.scrollTo(0, 0)')
+        await asyncio.sleep(0.3)
+        
+        # Try multiple selectors for job cards - LinkedIn changes these frequently
+        job_card_selectors = [
+            'li.scaffold-layout__list-item',
+            'li.jobs-search-results__list-item',
+            'div.job-card-container',
+            'div[data-job-id]',
+            '.jobs-search-results__list > li',
+            '.scaffold-layout__list > li',
+            'ul.scaffold-layout__list-container > li',
+        ]
+        
+        job_cards = []
+        for selector in job_card_selectors:
+            try:
+                cards = await page.query_selector_all(selector)
+                if cards and len(cards) > 0:
+                    job_cards = cards
+                    print(f"[OK] Found {len(cards)} job cards using: {selector}")
+                    break
+            except Exception as e:
+                print(f"[DEBUG] Selector {selector} failed: {str(e)[:30]}")
+                continue
+        
+        if not job_cards:
+            # Last resort - try to get any clickable job elements
+            print("[WARN] Standard selectors failed, trying alternative approach...")
+            await page.screenshot(path=str(screenshots_dir / "05_no_jobs_found.png"))
+            
+            # Check if we see the job search container at all
+            content = await page.content()
+            if 'jobs-search-results' in content or 'scaffold-layout__list' in content:
+                print("[DEBUG] Job container exists but couldn't select cards")
+            else:
+                print("[DEBUG] Job search container not found in page")
+        
+        jobs = []
+        max_jobs = config.get('max_applications', 5)
+        
+        print(f"[COLLECT] Processing up to {max_jobs * 2} job cards...")
+        
+        for i, card in enumerate(job_cards[:max_jobs * 2]):
+            try:
+                # Scroll card into view
+                await card.scroll_into_view_if_needed()
+                await asyncio.sleep(0.2)
+                
+                # Click on the card to load details
+                await card.click()
+                await asyncio.sleep(0.8)
+                
+                # Get job details with multiple fallback selectors
+                title = None
+                company = None
+                
+                # Title selectors
+                title_selectors = [
+                    'h1.job-details-jobs-unified-top-card__job-title',
+                    'h1.jobs-unified-top-card__job-title',
+                    'h1.t-24.t-bold.inline',
+                    'h2.job-details-jobs-unified-top-card__job-title',
+                    '.job-details-jobs-unified-top-card__job-title',
+                    'a.job-card-container__link span',
+                    'h3.job-card-list__title',
+                ]
+                
+                for sel in title_selectors:
+                    try:
+                        elem = await page.query_selector(sel)
+                        if elem:
+                            title = await elem.text_content()
+                            if title:
+                                title = title.strip()
+                                break
+                    except:
+                        continue
+                
+                # Company selectors
+                company_selectors = [
+                    'a.job-details-jobs-unified-top-card__company-name',
+                    'span.job-details-jobs-unified-top-card__company-name',
+                    '.jobs-unified-top-card__company-name',
+                    '.job-card-container__company-name',
+                    'div.job-card-container__primary-description',
+                    'a.job-card-container__company-name',
+                ]
+                
+                for sel in company_selectors:
+                    try:
+                        elem = await page.query_selector(sel)
+                        if elem:
+                            company = await elem.text_content()
+                            if company:
+                                company = company.strip()
+                                break
+                    except:
+                        continue
+                
+                if not company:
+                    company = "Unknown Company"
+                
+                # Check for Easy Apply button
+                easy_apply = False
+                easy_apply_selectors = [
+                    'button.jobs-apply-button',
+                    'button[aria-label*="Easy Apply"]',
+                    'button:has-text("Easy Apply")',
+                    '.jobs-apply-button--top-card',
+                ]
+                
+                for sel in easy_apply_selectors:
+                    try:
+                        btn = await page.query_selector(sel)
+                        if btn:
+                            btn_text = await btn.text_content() or ""
+                            if 'easy' in btn_text.lower() or 'apply' in btn_text.lower():
+                                easy_apply = True
+                                break
+                    except:
+                        continue
+                
+                if title:
+                    job_data = {
+                        'index': i + 1,
+                        'title': title[:100],
+                        'company': company[:50] if company else 'Unknown',
+                        'url': page.url,
+                        'easy_apply': easy_apply
+                    }
+                    
+                    if easy_apply:
+                        jobs.append(job_data)
+                        print(f"  [+] Job {len(jobs)}: {title[:45]}... @ {company[:20]}")
+                    else:
+                        print(f"  [-] Skipped (no Easy Apply): {title[:45]}...")
+                    
+                    if len(jobs) >= max_jobs:
+                        print(f"[OK] Collected target number of jobs: {max_jobs}")
+                        break
+                        
+            except Exception as e:
+                print(f"  [WARN] Error processing card {i+1}: {str(e)[:40]}")
+                continue
+        
+        result["jobs_found"] = len(jobs)
+        result["phase"] = "jobs_collected"
+        print(f"\n[OK] Collected {len(jobs)} Easy Apply jobs")
+        
+        await page.screenshot(path=str(screenshots_dir / "06_jobs_collected.png"))
+        
+        if not jobs:
+            print("[WARN] No Easy Apply jobs found - trying alternative method...")
+            # Take a screenshot for debugging
+            await page.screenshot(path=str(screenshots_dir / "07_no_easy_apply_jobs.png"))
+        
+        # ============ APPLICATION PHASE ============
+        dry_run = config.get('dry_run', True)
+        user_profile = config.get('user_profile', {})
+        
+        print(f"\n[APPLY] Starting applications (dry_run={dry_run})...")
+        
+        for job in jobs[:max_jobs]:
+            try:
+                print(f"\n[APPLY] Applying to: {job['title'][:40]}")
+                print(f"        Company: {job['company']}")
+                
+                # Navigate to job
+                await page.goto(job['url'], wait_until='domcontentloaded', timeout=60000)
+                await asyncio.sleep(1)
+                
+                # Find and click Easy Apply button
+                clicked = False
+                for sel in ['button.jobs-apply-button', 'button[aria-label*="Easy Apply"]', 'button:has-text("Easy Apply")']:
+                    try:
+                        btn = await page.query_selector(sel)
+                        if btn:
+                            await btn.click()
+                            clicked = True
+                            print("  [OK] Clicked Easy Apply button")
+                            break
+                    except:
+                        continue
+                
+                if not clicked:
+                    job['status'] = 'FAILED'
+                    job['error'] = 'Could not click Easy Apply button'
+                    result["applications"].append(job)
+                    print("  [WARN] Could not find Easy Apply button")
+                    continue
+                
+                await asyncio.sleep(0.5)
+                
+                _em = config.get('linkedin_email', '')
+
+                async def _fill_all(pg, up):
+                    """Run all three fillers in sequence: JS-based (primary) + legacy (fallback)."""
+                    await fill_form_fields_v2(pg, up, _em)          # PRIMARY: JS DOM scanner
+                    await fill_linkedin_form_questions(pg, up, _em)  # SECONDARY: section-based
+                    await fill_form_fields(pg, up, _em)              # TERTIARY: input:visible loop
+
+                # Process application steps
+                consecutive_no_progress = 0
+                for step in range(15):  # Max 15 steps
+                    await asyncio.sleep(0.2)
+                    
+                    print(f"  [STEP {step+1}] Filling form fields...")
+                    await _fill_all(page, user_profile)
+                    
+                    # ---- RESUME FILE UPLOAD ----
+                    await _handle_resume_upload(page, config)
+                    
+                    # Give LinkedIn a moment to validate fields after filling
+                    await asyncio.sleep(0.7)
+                    
+                    # Check for success messages
+                    success_found = False
+                    try:
+                        page_text = await page.text_content('body')
+                        if page_text and ('Application sent' in page_text or 'Your application was sent' in page_text):
+                            job['status'] = 'APPLIED'
+                            success_found = True
+                            print("  [SUCCESS] Application submitted successfully!")
+                    except:
+                        pass
+                    
+                    if success_found or job.get('status') == 'APPLIED':
+                        break
+                    
+                    # Click appropriate button - use CSS selectors with query_selector
+                    button_clicked = False
+                    
+                    # Look for buttons in modal footer first
+                    modal_footer_selectors = [
+                        'footer button[aria-label*="Submit"]',
+                        'footer button[aria-label*="Review"]', 
+                        'footer button[aria-label*="Next"]',
+                        'footer button[aria-label*="Continue"]',
+                        '.jobs-easy-apply-modal footer button',
+                        'div[role="dialog"] footer button',
+                        'div.artdeco-modal footer button',
+                    ]
+                    
+                    # Check for validation errors BEFORE clicking buttons — re-fill if any
+                    has_errors = False
+                    try:
+                        error_elements = await page.query_selector_all('.artdeco-inline-feedback--error')
+                        for err_el in error_elements:
+                            try:
+                                if await err_el.is_visible():
+                                    err_text = await err_el.text_content() or ''
+                                    if err_text.strip():
+                                        print(f"    [VALIDATION] Error detected: {err_text.strip()[:60]}")
+                                        has_errors = True
+                            except:
+                                pass
+                    except:
+                        pass
+                    
+                    if has_errors:
+                        print(f"    [RETRY] Re-filling form after validation errors...")
+                        await _fill_all(page, user_profile)
+                        await asyncio.sleep(0.7)
+                    
+                    # Get all visible footer buttons
+                    found_disabled_primary = False
+                    for footer_sel in modal_footer_selectors:
+                        try:
+                            buttons = await page.query_selector_all(footer_sel)
+                            for btn in buttons:
+                                if not btn:
+                                    continue
+                                    
+                                # Check if button is enabled (disabled attr + aria-disabled + property)
+                                if await _is_button_truly_disabled(btn):
+                                    btn_text_dbg = (await btn.text_content() or '').strip()
+                                    if any(x in btn_text_dbg.lower() for x in ['next', 'submit', 'review', 'continue']):
+                                        found_disabled_primary = True
+                                        print(f"    [DISABLED] Button '{btn_text_dbg[:20]}' is disabled — fields may still be required")
+                                    continue
+                                    
+                                btn_text = await btn.text_content() or ''
+                                btn_text = btn_text.strip().lower()
+                                aria_label = await btn.get_attribute('aria-label') or ''
+                                aria_label = aria_label.lower()
+                                
+                                # Check if this is a submit button
+                                if 'submit' in btn_text or 'submit' in aria_label:
+                                    if dry_run:
+                                        job['status'] = 'DRY_RUN'
+                                        print(f"  [DRY RUN] Would submit: {btn_text}")
+                                        button_clicked = True
+                                    else:
+                                        await btn.click()
+                                        await asyncio.sleep(2)
+                                        job['status'] = 'APPLIED'
+                                        print("  [SUCCESS] Submitted application!")
+                                        button_clicked = True
+                                    break
+                                
+                                # Check for navigation buttons (but not Back/Cancel)
+                                if any(x in btn_text or x in aria_label for x in ['next', 'continue', 'review']):
+                                    if 'back' not in btn_text and 'dismiss' not in btn_text and 'cancel' not in btn_text:
+                                        await btn.click()
+                                        print(f"  [STEP {step+1}] Clicked: {btn_text[:20]}")
+                                        button_clicked = True
+                                        await asyncio.sleep(0.8)
+                                        break
+                            
+                            if button_clicked:
+                                break
+                        except Exception as e:
+                            continue
+                    
+                    if job.get('status') in ['APPLIED', 'DRY_RUN']:
+                        break
+                    
+                    # Fallback: Try getting any primary action button  
+                    if not button_clicked:
+                        try:
+                            primary_btns = await _visible_query_all(page, 'button.artdeco-button--primary')
+                            for primary_btn in primary_btns:
+                                if not primary_btn:
+                                    continue
+                                if await _is_button_truly_disabled(primary_btn):
+                                    found_disabled_primary = True
+                                    continue
+                                btn_text = await primary_btn.text_content() or ''
+                                if 'back' not in btn_text.lower() and 'dismiss' not in btn_text.lower():
+                                    if 'submit' in btn_text.lower():
+                                        if dry_run:
+                                            job['status'] = 'DRY_RUN'
+                                            print(f"  [DRY RUN] Would submit: {btn_text.strip()}")
+                                        else:
+                                            await primary_btn.click()
+                                            job['status'] = 'APPLIED'
+                                            print("  [SUCCESS] Submitted!")
+                                        button_clicked = True
+                                        break
+                                    else:
+                                        await primary_btn.click()
+                                        print(f"  [STEP {step+1}] Clicked primary: {btn_text.strip()[:20]}")
+                                        button_clicked = True
+                                        break
+                        except:
+                            pass
+                    
+                    # If button was disabled → re-fill and retry ONCE more this step
+                    if not button_clicked and found_disabled_primary:
+                        print(f"    [RETRY-DISABLED] Primary button disabled — re-filling form...")
+                        await _fill_all(page, user_profile)
+                        await asyncio.sleep(1)
+                        # Try clicking again after re-fill
+                        try:
+                            primary_btns = await _visible_query_all(page, 'button.artdeco-button--primary')
+                            for primary_btn in primary_btns:
+                                if await _is_button_truly_disabled(primary_btn):
+                                    continue
+                                btn_text = await primary_btn.text_content() or ''
+                                if 'back' not in btn_text.lower() and 'dismiss' not in btn_text.lower():
+                                    await primary_btn.click()
+                                    print(f"  [STEP {step+1}] Clicked after re-fill: {btn_text.strip()[:20]}")
+                                    button_clicked = True
+                                    await asyncio.sleep(0.8)
+                                    break
+                        except:
+                            pass
+                    
+                    if not button_clicked:
+                        consecutive_no_progress += 1
+                        print(f"  [DEBUG] Step {step+1}: No clickable button found (streak={consecutive_no_progress})")
+                        if consecutive_no_progress >= 3:
+                            print(f"  [ABORT] {consecutive_no_progress} consecutive steps with no progress — giving up")
+                            break
+                    else:
+                        consecutive_no_progress = 0
+                
+                if not job.get('status'):
+                    job['status'] = 'INCOMPLETE'
+                    print("  [WARN] Application incomplete")
+                
+                result["applications"].append(job)
+                
+                # Close modal
+                try:
+                    for dismiss_sel in ['button[aria-label="Dismiss"]', 'button[aria-label="Close"]', 'button.artdeco-modal__dismiss']:
+                        btn = await page.query_selector(dismiss_sel)
+                        if btn:
+                            await btn.click()
+                            break
+                except:
+                    pass
+                
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                job['status'] = 'FAILED'
+                job['error'] = str(e)[:100]
+                result["applications"].append(job)
+                print(f"  [ERROR] {str(e)[:50]}")
+        
+        result["status"] = "completed"
+        result["phase"] = "completed"
+        
+        print(f"\n[DONE] Automation complete!")
+        print(f"       Jobs found: {result['jobs_found']}")
+        print(f"       Applications: {len(result['applications'])}")
+        
+    except Exception as e:
+        result["errors"].append(str(e))
+        print(f"\n[FATAL] Error: {str(e)}")
+    
+    finally:
+        # Keep browser open briefly for debugging
+        await asyncio.sleep(1)
+        
+        if context:
+            try:
+                await context.close()
+            except:
+                pass
+        
+        if playwright:
+            try:
+                await playwright.stop()
+            except:
+                pass
+        
+        print("[CLOSED] Browser closed")
+    
+    return result
+
+
+def _map_label_to_profile(label: str, user_profile: dict, email: str = '') -> str:
+    """Map a form field label to the correct user_profile value.
+    Single source of truth for label→value mapping used by both fillers."""
+    label = label.lower().strip()
+    if not label:
+        return ''
+
+    if any(x in label for x in ['first name', 'fname', 'given name', 'first_name']):
+        return user_profile.get('first_name', '')
+    if any(x in label for x in ['last name', 'lname', 'surname', 'family name', 'last_name']):
+        return user_profile.get('last_name', '')
+    if any(x in label for x in ['full name', 'your name']) or label.strip() == 'name':
+        return user_profile.get('full_name', '')
+    if 'email' in label:
+        return user_profile.get('email', '') or email
+    if any(x in label for x in ['phone', 'mobile', 'cell']):
+        return user_profile.get('phone_number', '') or user_profile.get('phone', '')
+    if any(x in label for x in ['street', 'address']):
+        return user_profile.get('address', '') or user_profile.get('street', '') or user_profile.get('street_address', '')
+    if any(x in label for x in ['city', 'location (city)']):
+        return user_profile.get('city', '')
+    if any(x in label for x in ['state', 'province', 'region']):
+        return user_profile.get('state', '')
+    if any(x in label for x in ['zip', 'postal', 'pincode', 'pin code']):
+        return user_profile.get('zip_code', '') or user_profile.get('postal_code', '')
+    if 'country' in label and 'code' not in label:
+        return user_profile.get('country', '')
+    if 'linkedin' in label and 'url' not in label.replace('linkedin url', ''):
+        return user_profile.get('linkedin_url', '')
+    if 'linkedin url' in label or label.strip() == 'linkedin':
+        return user_profile.get('linkedin_url', '')
+    if 'github' in label:
+        return user_profile.get('github_url', '')
+    if 'portfolio' in label or 'website' in label:
+        return user_profile.get('portfolio_url', '') or user_profile.get('website', '')
+    if any(x in label for x in ['current title', 'job title', 'current position', 'designation', 'position title']):
+        return user_profile.get('current_title', '')
+    if any(x in label for x in ['current company', 'company name', 'employer', 'current employer']):
+        return user_profile.get('current_company', '')
+    if any(x in label for x in ['skill set', 'skill', 'skills', 'expertise', 'technologies']):
+        return user_profile.get('skill_set', '') or user_profile.get('skills', '')
+    if 'notice period' in label:
+        return str(user_profile.get('notice_period', '')) if user_profile.get('notice_period') else ''
+    if 'location' in label and 'job' not in label:
+        return user_profile.get('city', '') or user_profile.get('location', '')
+    if any(x in label for x in ['overall experience', 'total experience', 'years of experience', 'work experience']):
+        return str(user_profile.get('years_experience', '')) if user_profile.get('years_experience') else ''
+    if any(x in label for x in ['expected ctc', 'expected salary', 'salary expectation']):
+        return str(user_profile.get('expected_ctc', '') or user_profile.get('expected_salary', ''))
+    if any(x in label for x in ['current ctc', 'current salary', 'current compensation']):
+        return str(user_profile.get('current_ctc', '')) if user_profile.get('current_ctc') else ''
+    if 'ctc' in label or 'salary' in label or 'compensation' in label:
+        return str(user_profile.get('ctc', '') or user_profile.get('current_ctc', ''))
+    if 'gpa' in label or 'cgpa' in label:
+        return str(user_profile.get('gpa', '')) if user_profile.get('gpa') else ''
+    # Skill-specific experience (e.g. "Years of Python experience")
+    skill_exp = user_profile.get('skill_experience', {})
+    for skill, years in skill_exp.items():
+        if skill.lower() in label:
+            return str(years)
+    if any(x in label for x in ['experience', 'years']):
+        return str(user_profile.get('years_experience', '')) if user_profile.get('years_experience') else ''
+    return ''
+
+
+_CONTACT_LABELS = [
+    'first name', 'last name', 'full name', 'email', 'phone', 'mobile', 'cell',
+    'street', 'address', 'city', 'state', 'province', 'zip', 'postal', 'country',
+    'linkedin', 'location',
+]
+
+
+async def fill_form_fields_v2(page, user_profile: dict, email: str):
+    """
+    Ultra-reliable form filler using JavaScript DOM scanning.
+    Reads labels directly from the browser DOM — no dependency on CSS class names.
+    Handles ALL visible input, textarea, and select elements on the current page.
+    """
+    # ── JS: collect every visible input/textarea with its resolved label ──────
+    _JS_SCAN = r"""() => {
+        function getLabel(el) {
+            // 1. aria-label
+            let t = el.getAttribute('aria-label') || '';
+            if (t.trim()) return t.trim();
+
+            // 2. aria-labelledby
+            const llby = el.getAttribute('aria-labelledby');
+            if (llby) {
+                t = llby.split(' ')
+                    .map(id => { const e = document.getElementById(id); return e ? e.textContent.trim() : ''; })
+                    .filter(Boolean).join(' ').trim();
+                if (t) return t;
+            }
+
+            // 3. <label for="id">
+            if (el.id) {
+                const lbl = document.querySelector('label[for="' + el.id + '"]');
+                if (lbl && lbl.textContent.trim()) return lbl.textContent.trim();
+            }
+
+            // 4. Closest container with a label/legend child
+            const containers = [
+                '.fb-dash-form-element', '.artdeco-text-input--container',
+                '.jobs-easy-apply-form-section__grouping', '.jobs-easy-apply-form-element',
+                '.artdeco-form__item', 'fieldset', '[data-test-form-element]',
+                'li', 'div.form-component'
+            ];
+            for (const sel of containers) {
+                try {
+                    const parent = el.closest(sel);
+                    if (!parent) continue;
+                    const lbl = parent.querySelector(
+                        'label, legend, span.artdeco-text-input__label, ' +
+                        '.fb-dash-form-element__label, span.t-bold, [class*="label"]'
+                    );
+                    if (lbl && lbl !== el && lbl.textContent.trim()) return lbl.textContent.trim();
+                } catch(e) {}
+            }
+
+            // 5. placeholder / name / id fallback
+            return el.placeholder || el.name || el.id || '';
+        }
+
+        const results = [];
+        const allEls = document.querySelectorAll('input, textarea');
+        for (const el of allEls) {
+            const skip = ['hidden','submit','button','checkbox','radio','file'];
+            if (skip.includes(el.type)) continue;
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
+            if (el.disabled || el.readOnly) continue;
+
+            const label = getLabel(el);
+            results.push({
+                label: label,
+                tag: el.tagName.toLowerCase(),
+                type: el.type || 'text',
+                id: el.id || '',
+                name: el.name || '',
+                value: el.value || ''
+            });
+        }
+        return results;
+    }"""
+
+    try:
+        fields = await page.evaluate(_JS_SCAN)
+    except Exception as e:
+        print(f"  [V2] JS scan error: {e}")
+        return
+
+    print(f"  [V2-SCAN] Found {len(fields)} visible inputs")
+
+    for info in fields:
+        try:
+            raw_label = (info.get('label') or '').strip()
+            label = raw_label.lower()
+            current_val = info.get('value', '')
+            field_id = info.get('id', '')
+            field_name = info.get('name', '')
+            field_type = info.get('type', 'text')
+            tag = info.get('tag', 'input')
+
+            # Locate the element
+            elem = None
+            if field_id:
+                elem = await page.query_selector(f'#{field_id}')
+            if not elem and field_name:
+                elem = await page.query_selector(f'{tag}[name="{field_name}"]')
+            if not elem:
+                continue
+
+            # Skip invisible/disabled
+            try:
+                if not await elem.is_visible():
+                    continue
+            except:
+                continue
+
+            # Determine fill value
+            fill_value = _map_label_to_profile(label, user_profile, email)
+
+            # Contact fields always override; others only fill if empty
+            is_contact = any(x in label for x in _CONTACT_LABELS)
+
+            if fill_value and str(fill_value).strip():
+                if is_contact or not current_val.strip():
+                    await elem.clear()
+                    await elem.fill(str(fill_value))
+                    await elem.press('Tab')
+                    print(f"    [V2-FILL] '{raw_label[:35]}' = '{str(fill_value)[:25]}'")
+                else:
+                    print(f"    [V2-SKIP] '{raw_label[:35]}' already='{current_val[:15]}'")
+            else:
+                if label:
+                    print(f"    [V2-NODATA] '{raw_label[:35]}' — no profile value")
+        except Exception as e:
+            continue
+
+    # ── Handle native <select> dropdowns ──────────────────────────────────────
+    try:
+        selects = await _visible_query_all(page, 'select')
+        for sel_el in selects:
+            try:
+                cur = await sel_el.input_value() or ''
+                if cur.strip():
+                    continue
+                label_text = await get_field_label(page, sel_el)
+                opts = await sel_el.query_selector_all('option')
+                val = await _pick_dropdown_value(label_text, opts, user_profile)
+                if val:
+                    await sel_el.select_option(val)
+                    print(f"    [V2-SELECT] '{label_text[:30]}' = '{val[:20]}'")
+            except:
+                continue
+    except:
+        pass
+
+    # ── Handle LinkedIn custom combobox dropdowns ──────────────────────────────
+    try:
+        triggers = await _visible_query_all(
+            page,
+            'button[aria-haspopup="listbox"], '
+            '[role="combobox"], '
+            'select[data-test-text-selectable-option]'
+        )
+        for trig in triggers:
+            try:
+                cur_text = (await trig.text_content() or '').strip()
+                if cur_text and cur_text.lower() not in ['select an option', 'select', 'choose', '', '--', 'please select']:
+                    continue
+                label_text = await get_field_label(page, trig)
+                await trig.click()
+                await page.wait_for_timeout(250)
+                # Find visible listbox — use helper since :visible fails in query_selector
+                listbox_candidates = await page.query_selector_all('[role="listbox"]')
+                listbox = None
+                for lb in listbox_candidates:
+                    try:
+                        if await lb.is_visible():
+                            listbox = lb
+                            break
+                    except:
+                        pass
+                if not listbox:
+                    await page.keyboard.press('Escape')
+                    continue
+                opts = await listbox.query_selector_all('[role="option"]')
+                if not opts:
+                    await page.keyboard.press('Escape')
+                    continue
+
+                chosen = None
+                lbl_lower = label_text.lower()
+
+                # Yes/No questions
+                if any(x in lbl_lower for x in ['authorized', 'sponsor', 'relocate', 'willing', 'legally', 'do you', 'have you', 'are you', 'can you']):
+                    desired = _resolve_yes_no_answer(lbl_lower, user_profile)
+                    for opt in opts:
+                        if (await opt.text_content() or '').strip().lower() == desired:
+                            chosen = opt; break
+                # Salutation
+                elif any(x in lbl_lower for x in ['salutation', 'prefix', 'title']):
+                    gender = (user_profile.get('gender', '') or '').lower()
+                    prefer = 'mr' if gender in ('male', 'm', '') else 'ms'
+                    for opt in opts:
+                        if prefer in (await opt.text_content() or '').strip().lower():
+                            chosen = opt; break
+                # Country
+                elif 'country' in lbl_lower and 'code' not in lbl_lower:
+                    cntry = (user_profile.get('country', '') or '').lower()
+                    for opt in opts:
+                        if cntry and cntry in (await opt.text_content() or '').lower():
+                            chosen = opt; break
+                # Job Title dropdown
+                elif any(x in lbl_lower for x in ['job title', 'current title', 'current job', 'designation']):
+                    title_val = (user_profile.get('current_title', '') or '').lower()
+                    for opt in opts:
+                        ot = (await opt.text_content() or '').strip().lower()
+                        if title_val and (title_val in ot or ot in title_val):
+                            chosen = opt; break
+
+                if not chosen and opts:
+                    chosen = opts[0]
+                if chosen:
+                    await chosen.click()
+                    opt_txt = (await chosen.text_content() or '').strip()
+                    print(f"    [V2-COMBO] '{lbl_lower[:30]}' = '{opt_txt[:20]}'")
+                else:
+                    await page.keyboard.press('Escape')
+            except:
+                try: await page.keyboard.press('Escape')
+                except: pass
+                continue
+    except:
+        pass
+
+
+async def get_field_label(page, element):
+    """Get the label text for a form field — handles LinkedIn's aria-labelledby pattern."""
+    label_text = ''
+    
+    try:
+        # Method 1: aria-label (direct)
+        aria_label = await element.get_attribute('aria-label')
+        if aria_label:
+            label_text += aria_label.lower() + ' '
+        
+        # Method 2: aria-labelledby — LinkedIn's PRIMARY label mechanism
+        # e.g. <span id="label-xyz">Mobile phone number</span>
+        #       <input aria-labelledby="label-xyz" />
+        labelledby = await element.get_attribute('aria-labelledby')
+        if labelledby:
+            for ref_id in labelledby.split():
+                try:
+                    ref_elem = await page.query_selector(f'#{ref_id}')
+                    if ref_elem:
+                        text = await ref_elem.text_content()
+                        if text:
+                            label_text += text.lower() + ' '
+                except:
+                    pass
+        
+        # Method 3: associated <label for="id">
+        elem_id = await element.get_attribute('id')
+        if elem_id:
+            label_elem = await page.query_selector(f'label[for="{elem_id}"]')
+            if label_elem:
+                text = await label_elem.text_content()
+                if text:
+                    label_text += text.lower() + ' '
+        
+        # Method 4: parent <label> wrapping the input
+        parent_label = await element.evaluate_handle('el => el.closest("label")')
+        if parent_label:
+            text = await parent_label.evaluate('el => el ? el.textContent : ""')
+            if text:
+                label_text += text.lower() + ' '
+        
+        # Method 5: nearest LinkedIn form section — scan for label/span
+        section_text = await element.evaluate('''el => {
+            const containers = [
+                ".fb-dash-form-element",
+                ".artdeco-text-input--container",
+                ".jobs-easy-apply-form-section__grouping",
+                ".jobs-easy-apply-form-element",
+                ".artdeco-form__item",
+                "fieldset"
+            ];
+            for (const sel of containers) {
+                const parent = el.closest(sel);
+                if (parent) {
+                    const lbl = parent.querySelector(
+                        'label, [data-test-form-element-label], .fb-dash-form-element__label, ' +
+                        'legend, span.t-bold, span.artdeco-text-input__label'
+                    );
+                    if (lbl && lbl.textContent.trim()) return lbl.textContent.trim();
+                }
+            }
+            return "";
+        }''')
+        if section_text:
+            label_text += section_text.lower() + ' '
+        
+        # Method 6: placeholder, name, id as last resort
+        for attr in ['placeholder', 'name', 'id']:
+            val = await element.get_attribute(attr)
+            if val:
+                label_text += val.lower() + ' '
+                
+    except:
+        pass
+    
+    return label_text
+
+
+def _resolve_yes_no_answer(label: str, user_profile: dict) -> str:
+    """Return 'yes' or 'no' for a Yes/No question based on user_profile data.
+    
+    Uses explicit profile fields when available (work_authorization, sponsorship, relocate),
+    otherwise defaults to 'yes' for positive questions and 'no' for sponsorship questions.
+    """
+    label = label.lower()
+    
+    # Sponsorship: user said they DON'T need it → answer "No" to "Do you need sponsorship?"
+    if any(x in label for x in ['sponsor', 'require visa', 'need sponsorship', 'immigration']):
+        val = str(user_profile.get('sponsorship', 'no')).lower()
+        if val in ['no', 'false', '0', 'n']:
+            return 'no'
+        return 'yes'
+    
+    # Work authorization
+    if any(x in label for x in ['authorized', 'eligible', 'legally', 'work authorization', 'right to work']):
+        val = str(user_profile.get('work_authorization', 'yes')).lower()
+        if val in ['yes', 'true', '1', 'y']:
+            return 'yes'
+        return 'no'
+    
+    # Relocation
+    if any(x in label for x in ['relocate', 'willing to relocate', 'relocation']):
+        val = str(user_profile.get('relocate', 'yes')).lower()
+        if val in ['yes', 'true', '1', 'y']:
+            return 'yes'
+        return 'no'
+    
+    # General positive questions
+    if any(x in label for x in [
+        'can you', 'do you have', 'are you', 'have you',
+        'completed', 'degree', 'education', 'bachelor', 'master',
+        'proficient', 'fluent', 'experience with', 'familiar with', 'worked with'
+    ]):
+        return 'yes'
+    
+    return 'yes'
+
+
+async def _pick_dropdown_value(label: str, options, user_profile: dict) -> str:
+    """Smart dropdown value picker. Returns the option value string or empty string."""
+    label = label.lower()
+    
+    # Country code
+    if any(x in label for x in ['country code', 'phone code']):
+        country = (user_profile.get('country', '') or '').lower()
+        for opt in options:
+            opt_text = (await opt.text_content() or '').lower()
+            # Try to match user's country
+            if country and country in opt_text:
+                return await opt.get_attribute('value') or ''
+        # Fallback: try common
+        for opt in options:
+            opt_text = (await opt.text_content() or '').lower()
+            if 'united states' in opt_text or '+1' in opt_text:
+                return await opt.get_attribute('value') or ''
+    
+    # Yes/No questions
+    if any(x in label for x in ['authorized', 'sponsor', 'relocate', 'willing', 'legally',
+                                  'do you', 'have you', 'are you', 'can you']):
+        desired = _resolve_yes_no_answer(label, user_profile)
+        for opt in options:
+            opt_text = (await opt.text_content() or '').strip().lower()
+            if opt_text == desired:
+                return await opt.get_attribute('value') or ''
+    
+    # Experience dropdown
+    if 'experience' in label or 'years' in label:
+        yrs = user_profile.get('years_experience', '')
+        if yrs:
+            yrs_int = int(str(yrs)) if str(yrs).isdigit() else 0
+            # Try to find a range that covers the user's years
+            best_opt = None
+            for opt in options:
+                opt_text = (await opt.text_content() or '').lower().strip()
+                # e.g., "3-5 years", "5+", "3"
+                import re
+                nums = re.findall(r'\d+', opt_text)
+                if nums:
+                    lo = int(nums[0])
+                    hi = int(nums[-1]) if len(nums) > 1 else lo + 2
+                    if lo <= yrs_int <= hi:
+                        return await opt.get_attribute('value') or ''
+                    if not best_opt:
+                        best_opt = await opt.get_attribute('value') or ''
+    
+    # Education / degree
+    if 'degree' in label or 'education' in label:
+        edu_level = (user_profile.get('education_level', '') or '').lower()
+        for opt in options:
+            opt_text = (await opt.text_content() or '').lower()
+            if edu_level and edu_level in opt_text:
+                return await opt.get_attribute('value') or ''
+        # Fallback: bachelor's
+        for opt in options:
+            opt_text = (await opt.text_content() or '').lower()
+            if any(x in opt_text for x in ['bachelor', 'b.tech', 'b.e.', 'undergraduate']):
+                return await opt.get_attribute('value') or ''
+    
+    # Gender
+    if 'gender' in label:
+        gender = (user_profile.get('gender', '') or '').lower()
+        if gender:
+            for opt in options:
+                opt_text = (await opt.text_content() or '').lower()
+                if gender in opt_text:
+                    return await opt.get_attribute('value') or ''
+    
+    # Salutation (Mr./Mrs./Ms./Dr.)
+    if 'salutation' in label or 'title' == label.strip() or 'prefix' in label:
+        gender = (user_profile.get('gender', '') or '').lower()
+        prefer = 'mr' if gender in ('male', 'm', '') else 'ms'
+        for opt in options:
+            opt_text = (await opt.text_content() or '').lower().strip()
+            if prefer in opt_text:
+                return await opt.get_attribute('value') or ''
+    
+    # Country (not country code)
+    if label.strip() == 'country' or (label.strip().startswith('country') and 'code' not in label):
+        country = (user_profile.get('country', '') or '').lower()
+        if country:
+            for opt in options:
+                opt_text = (await opt.text_content() or '').lower()
+                if country in opt_text:
+                    return await opt.get_attribute('value') or ''
+    
+    # Current Job Title / Designation (text match)
+    if any(x in label for x in ['current title', 'job title', 'current position', 'designation']):
+        title = (user_profile.get('current_title', '') or '').lower()
+        if title:
+            for opt in options:
+                opt_text = (await opt.text_content() or '').lower()
+                if title in opt_text or opt_text in title:
+                    return await opt.get_attribute('value') or ''
+    
+    # Default: select first non-placeholder option
+    for opt in options[1:]:
+        value = await opt.get_attribute('value')
+        if value and value.strip() and value.lower() not in ['', 'select', 'choose', '-1']:
+            return value
+    
+    return ""
+
+
+async def _handle_linkedin_custom_dropdowns(page, user_profile: dict, filled_count: int):
+    """Handle LinkedIn custom dropdowns that use aria/listbox pattern instead of native <select>.
+    
+    LinkedIn uses: button/div[role="combobox"] → clicking opens a [role="listbox"]
+    with [role="option"] children. We click the trigger, scan options, and pick the best match.
+    """
+    try:
+        # Find custom dropdown triggers that are NOT yet set
+        triggers = await _visible_query_all(
+            page,
+            'button[aria-haspopup="listbox"], '
+            '[role="combobox"], '
+            'div[data-test-text-selectable-option], '
+            '.artdeco-dropdown__trigger'
+        )
+        
+        for trigger in triggers:
+            try:
+                # Check if already has a selection
+                current_text = (await trigger.text_content() or '').strip()
+                if current_text and current_text.lower() not in ['select an option', 'select', 'choose', '', '--']:
+                    continue
+                
+                # Get parent section label
+                parent_section = await trigger.evaluate_handle(
+                    'el => el.closest(".fb-dash-form-element, .jobs-easy-apply-form-section__grouping, fieldset")'
+                )
+                label = ''
+                if parent_section:
+                    label_elem = await parent_section.as_element().query_selector(
+                        'label, .fb-dash-form-element__label, legend, span.t-bold'
+                    )
+                    if label_elem:
+                        label = (await label_elem.text_content() or '').lower().strip()
+                
+                # Click to open
+                await trigger.click()
+                await page.wait_for_timeout(300)
+                
+                # Find the listbox options
+                # Find visible listbox
+                listbox_candidates = await page.query_selector_all('[role="listbox"]')
+                listbox = None
+                for lb in listbox_candidates:
+                    try:
+                        if await lb.is_visible():
+                            listbox = lb
+                            break
+                    except:
+                        pass
+                if not listbox:
+                    # Try to dismiss if nothing opened
+                    await page.keyboard.press('Escape')
+                    continue
+                
+                option_elems = await listbox.query_selector_all('[role="option"]')
+                if not option_elems:
+                    await page.keyboard.press('Escape')
+                    continue
+                
+                # Determine desired answer
+                desired = _resolve_yes_no_answer(label, user_profile)
+                
+                chosen = None
+                # Try exact yes/no match first
+                for opt_elem in option_elems:
+                    opt_text = (await opt_elem.text_content() or '').strip().lower()
+                    if opt_text == desired:
+                        chosen = opt_elem
+                        break
+                
+                # If not a yes/no question, try smart matching
+                if not chosen:
+                    if 'experience' in label or 'years' in label:
+                        yrs = user_profile.get('years_experience', '')
+                        if yrs:
+                            import re
+                            yrs_int = int(str(yrs)) if str(yrs).isdigit() else 0
+                            for opt_elem in option_elems:
+                                opt_text = (await opt_elem.text_content() or '').lower()
+                                nums = re.findall(r'\d+', opt_text)
+                                if nums:
+                                    lo = int(nums[0])
+                                    hi = int(nums[-1]) if len(nums) > 1 else lo + 2
+                                    if lo <= yrs_int <= hi:
+                                        chosen = opt_elem
+                                        break
+                
+                # Fallback: first option
+                if not chosen and option_elems:
+                    chosen = option_elems[0]
+                
+                if chosen:
+                    await chosen.click()
+                    filled_count += 1
+                    opt_text = (await chosen.text_content() or '').strip()
+                    print(f"    [CUSTOM-DD] {label[:30]}: {opt_text[:20]}")
+                else:
+                    await page.keyboard.press('Escape')
+                    
+            except Exception:
+                try:
+                    await page.keyboard.press('Escape')
+                except:
+                    pass
+                continue
+    except Exception as e:
+        print(f"  [CUSTOM-DD] Error: {str(e)[:40]}")
+
+
+async def _handle_resume_upload(page, config: dict):
+    """Detect file upload inputs on the current page and attach the user's resume.
+    
+    LinkedIn Easy Apply sometimes shows a 'Upload resume' step with an <input type="file">.
+    We look for any visible file input or the upload button area and attach the resume file.
+    """
+    resume_path = config.get('resume_path', '')
+    if not resume_path:
+        return
+    
+    import os
+    if not os.path.isfile(resume_path):
+        print(f"  [UPLOAD] Resume file not found: {resume_path}")
+        return
+    
+    try:
+        # Method 1: Find <input type="file"> (may be hidden but still functional)
+        file_inputs = await page.query_selector_all('input[type="file"]')
+        for fi in file_inputs:
+            try:
+                await fi.set_input_files(resume_path)
+                print(f"  [UPLOAD] Attached resume via file input: {os.path.basename(resume_path)}")
+                await page.wait_for_timeout(500)
+                return
+            except Exception:
+                continue
+        
+        # Method 2: LinkedIn-specific upload area — look for upload label/button
+        upload_btns = await page.query_selector_all(
+            'label[for*="file"], '
+            'button[aria-label*="upload" i], '
+            'button[aria-label*="Upload" i], '
+            '.jobs-document-upload__upload-button'
+        )
+        for btn in upload_btns:
+            try:
+                # The label might be associated with a hidden file input
+                for_attr = await btn.get_attribute('for')
+                if for_attr:
+                    hidden_input = await page.query_selector(f'#{for_attr}')
+                    if hidden_input:
+                        await hidden_input.set_input_files(resume_path)
+                        print(f"  [UPLOAD] Attached resume via label target: {os.path.basename(resume_path)}")
+                        await page.wait_for_timeout(500)
+                        return
+            except Exception:
+                continue
+        
+    except Exception as e:
+        print(f"  [UPLOAD] Error attaching resume: {str(e)[:50]}")
+
+
+async def fill_form_fields(page, user_profile: dict, email: str):
+    """Fill visible form fields with user data - enhanced version.
+    
+    Priority: user_profile values > parsed resume > skip (never hardcode).
+    """
+    filled_count = 0
+    skill_exp = user_profile.get('skill_experience', {})  # e.g. {"python": 2, "react": 1}
+    
+    # Debug: log all profile values being used for filling
+    print(f"  [FILL-DEBUG] Profile: first_name='{user_profile.get('first_name')}' last_name='{user_profile.get('last_name')}'")
+    print(f"  [FILL-DEBUG] Phone='{user_profile.get('phone_number')}' Email='{user_profile.get('email')}'")
+    print(f"  [FILL-DEBUG] City='{user_profile.get('city')}' State='{user_profile.get('state')}' Zip='{user_profile.get('zip_code')}'")
+    print(f"  [FILL-DEBUG] Country='{user_profile.get('country')}' Address='{user_profile.get('address')}'")
+    print(f"  [FILL-DEBUG] LinkedIn='{user_profile.get('linkedin_url')}' Title='{user_profile.get('current_title')}'")
+    
+    def _get_experience_for_label(lbl: str) -> str:
+        """Return skill-specific experience from parsed resume, or overall years."""
+        lbl_lower = lbl.lower()
+        # Check skill_experience map for exact tech match
+        for skill, years in skill_exp.items():
+            if skill.lower() in lbl_lower:
+                return str(years)
+        # Fallback to overall years_experience from profile
+        return str(user_profile.get('years_experience', '')) if user_profile.get('years_experience') else ''
+
+    try:
+        # ============ HANDLE TEXT INPUTS ============
+        inputs = await _visible_query_all(page, 'input')
+        
+        for inp in inputs:
+            try:
+                input_type = await inp.get_attribute('type') or 'text'
+                if input_type in ['hidden', 'submit', 'button', 'checkbox', 'radio', 'file']:
+                    continue
+                
+                disabled = await inp.get_attribute('disabled')
+                readonly = await inp.get_attribute('readonly')
+                if disabled or readonly:
+                    continue
+                
+                # Get label FIRST — determines whether we override pre-filled values
+                label = await get_field_label(page, inp)
+                current_value = await inp.input_value() or ''
+                fill_value = None
+                # Contact/identity fields: always override with profile values
+                # (corrects corrupted data from previous bad runs)
+                is_override_field = False
+                
+                if any(x in label for x in ['first name', 'fname', 'given name']):
+                    fill_value = user_profile.get('first_name', '')
+                    is_override_field = True
+                elif any(x in label for x in ['last name', 'lname', 'surname', 'family name']):
+                    fill_value = user_profile.get('last_name', '')
+                    is_override_field = True
+                elif any(x in label for x in ['full name', 'your name']) or label.strip() == 'name':
+                    fill_value = user_profile.get('full_name', '')
+                    is_override_field = True
+                elif 'email' in label:
+                    fill_value = user_profile.get('email', '') or email
+                    is_override_field = True
+                elif any(x in label for x in ['phone', 'mobile', 'cell']) or input_type == 'tel':
+                    # Phone: always override — pre-filled value may be corrupted from a previous run
+                    fill_value = user_profile.get('phone_number', '') or user_profile.get('phone', '')
+                    is_override_field = True
+                elif any(x in label for x in ['city', 'location (city)']):
+                    fill_value = user_profile.get('city', '')
+                    is_override_field = True
+                elif any(x in label for x in ['state', 'province']):
+                    fill_value = user_profile.get('state', '')
+                    is_override_field = True
+                elif any(x in label for x in ['zip', 'postal', 'pincode', 'pin code']):
+                    fill_value = user_profile.get('zip_code', '') or user_profile.get('postal_code', '')
+                    is_override_field = True
+                elif any(x in label for x in ['street', 'address']):
+                    fill_value = user_profile.get('address', '') or user_profile.get('street_address', '') or user_profile.get('street', '')
+                    is_override_field = True
+                elif 'country' in label:
+                    fill_value = user_profile.get('country', '')
+                    is_override_field = True
+                elif 'location' in label and 'job' not in label:
+                    # Generic "location" field — use city or job_location
+                    fill_value = user_profile.get('city', '') or user_profile.get('location', '')
+                    is_override_field = True
+                else:
+                    # Non-contact fields: only fill if the field is empty
+                    if current_value.strip():
+                        continue
+                    
+                    # Experience fields — use skill-specific years from resume parse
+                    if any(x in label for x in ['overall experience', 'total experience', 'years of experience', 'work experience']):
+                        fill_value = str(user_profile.get('years_experience', '')) if user_profile.get('years_experience') else ''
+                    elif any(x in label for x in ['relevant experience', 'experience with', 'years in']):
+                        fill_value = _get_experience_for_label(label)
+                    elif any(x in label for x in ['python', 'java', 'javascript', 'react', 'angular', 'node',
+                                                    'ai', 'ml', 'machine learning', 'deep learning', 'nlp',
+                                                    'aws', 'azure', 'gcp', 'docker', 'kubernetes',
+                                                    'sql', 'mongodb', 'redis', 'api', 'rest',
+                                                    'jira', 'agile', 'scrum', 'devops', 'ci/cd',
+                                                    'generative ai', 'genai', 'llm', 'transformer']):
+                        fill_value = _get_experience_for_label(label)
+                    elif 'notice period' in label:
+                        fill_value = str(user_profile.get('notice_period', ''))
+                    elif any(x in label for x in ['ctc', 'salary', 'compensation']):
+                        if 'expected' in label:
+                            fill_value = str(user_profile.get('expected_ctc', '') or user_profile.get('expected_salary', ''))
+                        else:
+                            fill_value = str(user_profile.get('current_ctc', '') or user_profile.get('ctc', ''))
+                    elif 'gpa' in label or 'cgpa' in label:
+                        fill_value = str(user_profile.get('gpa', ''))
+                    elif 'linkedin' in label:
+                        fill_value = user_profile.get('linkedin_url', '')
+                    elif 'github' in label:
+                        fill_value = user_profile.get('github_url', '')
+                    elif 'portfolio' in label or 'website' in label:
+                        fill_value = user_profile.get('portfolio_url', '') or user_profile.get('website', '')
+                    elif any(x in label for x in ['current title', 'job title', 'current position', 'designation']):
+                        fill_value = user_profile.get('current_title', '')
+                    elif any(x in label for x in ['current company', 'company name', 'employer', 'current employer']):
+                        fill_value = user_profile.get('current_company', '')
+                    elif 'twitter' in label or 'x.com' in label:
+                        fill_value = ''  # Skip twitter — leave blank
+                    elif 'facebook' in label:
+                        fill_value = ''  # Skip facebook — leave blank
+                    elif input_type == 'number':
+                        # Only fill numeric fields whose label matches known experience keywords
+                        if any(x in label for x in ['year', 'experience', 'salary', 'ctc', 'gpa', 'notice', 'age']):
+                            fill_value = str(user_profile.get('years_experience', '')) if user_profile.get('years_experience') else ''
+                        # else: unknown numeric field — leave blank
+                
+                if fill_value and str(fill_value).strip():
+                    # For override fields: always clear and write correct value
+                    # For other fields: only write if currently empty
+                    if is_override_field or not current_value.strip():
+                        await inp.clear()
+                        await inp.fill(str(fill_value))
+                        await inp.press('Tab')
+                        filled_count += 1
+                        print(f"    [FILL] {label[:40]}: '{str(fill_value)[:25]}'")
+                else:
+                    if label.strip():
+                        print(f"    [FILL-SKIP] label='{label[:40]}' type={input_type} current='{current_value[:15]}' -> no profile value")
+                    
+            except Exception:
+                continue
+        
+        # ============ HANDLE TEXTAREAS ============
+        textareas = await _visible_query_all(page, 'textarea')
+        for textarea in textareas:
+            try:
+                current_value = await textarea.input_value() or ''
+                if current_value.strip():
+                    continue
+                
+                label = await get_field_label(page, textarea)
+                
+                fill_value = None
+                if any(x in label for x in ['cover letter', 'why', 'about you', 'summary', 'describe']):
+                    fill_value = user_profile.get('cover_letter', '')
+                elif any(x in label for x in ['skill', 'skills', 'skill set', 'expertise', 'technologies']):
+                    fill_value = user_profile.get('skill_set', '') or user_profile.get('skills', '')
+                elif 'additional' in label or 'other' in label or 'comment' in label:
+                    fill_value = 'N/A'
+                
+                if fill_value and str(fill_value).strip():
+                    await textarea.fill(str(fill_value))
+                    filled_count += 1
+                    
+            except:
+                continue
+        
+        # ============ HANDLE SELECT DROPDOWNS (native <select>) ============
+        selects = await _visible_query_all(page, 'select')
+        for select in selects:
+            try:
+                current_value = await select.input_value()
+                if current_value and current_value.strip():
+                    continue
+                
+                label = await get_field_label(page, select)
+                options = await select.query_selector_all('option')
+                
+                if len(options) <= 1:
+                    continue
+                
+                target_value = await _pick_dropdown_value(label, options, user_profile)
+                
+                if target_value:
+                    await select.select_option(target_value)
+                    filled_count += 1
+                    print(f"    [SELECT] {label[:30]}: {target_value[:20]}")
+                    
+            except:
+                continue
+        
+        # ============ HANDLE LINKEDIN CUSTOM DROPDOWNS (listbox/aria pattern) ============
+        await _handle_linkedin_custom_dropdowns(page, user_profile, filled_count)
+        
+        # ============ HANDLE RADIO BUTTONS ============
+        radio_groups = await page.query_selector_all('fieldset, [role="radiogroup"], .fb-dash-form-element')
+        
+        for group in radio_groups:
+            try:
+                radios = await group.query_selector_all('input[type="radio"]')
+                if not radios or len(radios) == 0:
+                    continue
+                
+                any_checked = False
+                for radio in radios:
+                    if await radio.is_checked():
+                        any_checked = True
+                        break
+                
+                if any_checked:
+                    continue
+                
+                label = ''
+                legend = await group.query_selector('legend, label')
+                if legend:
+                    label = (await legend.text_content() or '').lower()
+                
+                desired = _resolve_yes_no_answer(label, user_profile)
+                
+                selected = False
+                for radio in radios:
+                    radio_label = (await get_field_label(page, radio)).lower()
+                    if desired == 'yes' and 'yes' in radio_label:
+                        await radio.check()
+                        selected = True
+                        filled_count += 1
+                        print(f"    [RADIO] 'Yes' for: {label[:40]}")
+                        break
+                    elif desired == 'no' and 'no' in radio_label:
+                        await radio.check()
+                        selected = True
+                        filled_count += 1
+                        print(f"    [RADIO] 'No' for: {label[:40]}")
+                        break
+                
+                if not selected and radios:
+                    await radios[0].check()
+                    filled_count += 1
+                    
+            except:
+                continue
+        
+        # ============ HANDLE CHECKBOXES ============
+        checkboxes = await _visible_query_all(page, 'input[type="checkbox"]')
+        for checkbox in checkboxes:
+            try:
+                if await checkbox.is_checked():
+                    continue
+                
+                label = await get_field_label(page, checkbox)
+                
+                # Check boxes for terms, agreements, acknowledgments
+                if any(x in label for x in ['agree', 'accept', 'acknowledge', 'confirm', 'terms', 'privacy', 'consent']):
+                    await checkbox.check()
+                    filled_count += 1
+                    
+            except:
+                continue
+        
+        if filled_count > 0:
+            print(f"    [FORM] Filled {filled_count} fields")
+            
+    except Exception as e:
+        print(f"  [FORM] Error filling fields: {str(e)[:50]}")
+
+
+async def fill_linkedin_form_questions(page, user_profile: dict, email: str):
+    """
+    LinkedIn-specific form filler that handles question-based form elements.
+    Uses user_profile values only — no hardcoded fallbacks.
+    For tech-specific experience questions, consults skill_experience map from resume.
+    """
+    filled_count = 0
+    skill_exp = user_profile.get('skill_experience', {})
+    
+    def _skill_years(question: str) -> str:
+        """Lookup skill-specific experience from resume, else overall years."""
+        q = question.lower()
+        for skill, years in skill_exp.items():
+            if skill.lower() in q:
+                return str(years)
+        return str(user_profile.get('years_experience', '')) if user_profile.get('years_experience') else ''
+    
+    try:
+        form_sections = await page.query_selector_all(
+            '.jobs-easy-apply-form-section__grouping, '
+            '.fb-dash-form-element, '
+            '.artdeco-text-input, '
+            '.jobs-easy-apply-form-element'
+        )
+        
+        for section in form_sections:
+            try:
+                question_text = ''
+                label_elem = await section.query_selector('label, .fb-dash-form-element__label, span.t-14, span.t-bold')
+                if label_elem:
+                    question_text = await label_elem.text_content() or ''
+                    question_text = question_text.lower().strip()
+                
+                if not question_text:
+                    question_text = (await section.text_content() or '').lower()
+                
+                # ---- TEXT / NUMBER / TEL INPUTS ----
+                inp = await section.query_selector('input:not([type="hidden"]):not([type="submit"]):not([type="radio"]):not([type="checkbox"])')
+                if inp:
+                    current_value = await inp.input_value() or ''
+                    # NOTE: do NOT skip pre-filled fields here — contact fields must always be overridden.
+                    # The per-field logic below decides whether to skip or override.
+                    
+                    # Explicit tel/phone override — before label matching
+                    inp_type = await inp.get_attribute('type') or 'text'
+                    
+                    # Phone/tel fields: ALWAYS override even if pre-filled
+                    # (corrects corrupted data from previous bad runs)
+                    if inp_type == 'tel' or 'phone' in question_text or 'mobile' in question_text:
+                        fill_value = user_profile.get('phone_number', '') or user_profile.get('phone', '')
+                        if fill_value and str(fill_value).strip():
+                            await inp.clear()
+                            await inp.fill(str(fill_value))
+                            await inp.press('Tab')
+                            filled_count += 1
+                            print(f"    [Q&A PHONE] phone: {str(fill_value)[:15]}")
+                        continue
+                    
+                    fill_value = None
+                    
+                    # Contact/identity fields: always override with profile values
+                    if any(x in question_text for x in ['first name', 'fname', 'given name']):
+                        fill_value = user_profile.get('first_name', '')
+                        # Override even if pre-filled
+                        await inp.clear()
+                        await inp.fill(str(fill_value)) if fill_value else None
+                        if fill_value: await inp.press('Tab'); filled_count += 1
+                        continue
+                    elif any(x in question_text for x in ['last name', 'lname', 'surname']):
+                        fill_value = user_profile.get('last_name', '')
+                        await inp.clear()
+                        await inp.fill(str(fill_value)) if fill_value else None
+                        if fill_value: await inp.press('Tab'); filled_count += 1
+                        continue
+                    elif 'email' in question_text:
+                        fill_value = user_profile.get('email', '') or email
+                        await inp.clear()
+                        await inp.fill(str(fill_value)) if fill_value else None
+                        if fill_value: await inp.press('Tab'); filled_count += 1
+                        continue
+                    elif any(x in question_text for x in ['city', 'location (city)']):
+                        fill_value = user_profile.get('city', '')
+                        await inp.clear()
+                        await inp.fill(str(fill_value)) if fill_value else None
+                        if fill_value: await inp.press('Tab'); filled_count += 1
+                        continue
+                    elif any(x in question_text for x in ['street', 'address line']):
+                        fill_value = user_profile.get('address', '') or user_profile.get('street', '')
+                        await inp.clear()
+                        await inp.fill(str(fill_value)) if fill_value else None
+                        if fill_value: await inp.press('Tab'); filled_count += 1
+                        continue
+                    elif any(x in question_text for x in ['state', 'province']):
+                        fill_value = user_profile.get('state', '')
+                        await inp.clear()
+                        await inp.fill(str(fill_value)) if fill_value else None
+                        if fill_value: await inp.press('Tab'); filled_count += 1
+                        continue
+                    elif any(x in question_text for x in ['zip', 'postal code', 'pincode', 'pin code']):
+                        fill_value = user_profile.get('zip_code', '') or user_profile.get('postal_code', '')
+                        await inp.clear()
+                        await inp.fill(str(fill_value)) if fill_value else None
+                        if fill_value: await inp.press('Tab'); filled_count += 1
+                        continue
+                    elif 'country' in question_text:
+                        fill_value = user_profile.get('country', '')
+                        await inp.clear()
+                        await inp.fill(str(fill_value)) if fill_value else None
+                        if fill_value: await inp.press('Tab'); filled_count += 1
+                        continue
+                    elif 'location' in question_text and 'job' not in question_text:
+                        fill_value = user_profile.get('city', '') or user_profile.get('location', '')
+                        await inp.clear()
+                        await inp.fill(str(fill_value)) if fill_value else None
+                        if fill_value: await inp.press('Tab'); filled_count += 1
+                        continue
+                    elif 'linkedin' in question_text:
+                        fill_value = user_profile.get('linkedin_url', '')
+                        await inp.clear()
+                        await inp.fill(str(fill_value)) if fill_value else None
+                        if fill_value: await inp.press('Tab'); filled_count += 1
+                        continue
+                    
+                    # Non-contact fields: skip if already filled
+                    if current_value.strip():
+                        continue
+                    
+                    fill_value = None
+                    
+                    # Overall / total experience
+                    if any(x in question_text for x in ['overall experience', 'total experience', 'years of experience']):
+                        fill_value = str(user_profile.get('years_experience', '')) if user_profile.get('years_experience') else ''
+                    # Skill-specific experience
+                    elif any(x in question_text for x in [
+                        'relevant experience', 'experience with', 'experience in',
+                        'python', 'java', 'react', 'angular', 'node', 'javascript', 'typescript',
+                        'ai', 'ml', 'machine learning', 'deep learning', 'nlp', 'genai', 'llm',
+                        'aws', 'azure', 'gcp', 'docker', 'kubernetes', 'devops',
+                        'sql', 'mongodb', 'redis', 'api', 'rest', 'graphql',
+                        'agile', 'scrum', 'jira', 'ci/cd'
+                    ]):
+                        fill_value = _skill_years(question_text)
+                    elif 'notice period' in question_text:
+                        fill_value = str(user_profile.get('notice_period', '')) if user_profile.get('notice_period') else ''
+                    elif any(x in question_text for x in ['current ctc', 'your ctc', 'current salary', 'current compensation']):
+                        fill_value = str(user_profile.get('current_ctc', '')) if user_profile.get('current_ctc') else ''
+                    elif any(x in question_text for x in ['expected ctc', 'expected salary', 'salary expectation']):
+                        fill_value = str(user_profile.get('expected_ctc', '') or user_profile.get('expected_salary', '')) or ''
+                    elif 'ctc' in question_text or 'salary' in question_text:
+                        fill_value = str(user_profile.get('ctc', '')) if user_profile.get('ctc') else ''
+                    elif 'gpa' in question_text or 'cgpa' in question_text:
+                        fill_value = str(user_profile.get('gpa', '')) if user_profile.get('gpa') else ''
+                    elif 'city' in question_text:
+                        fill_value = user_profile.get('city', '')
+                    elif 'state' in question_text:
+                        fill_value = user_profile.get('state', '')
+                    elif 'zip' in question_text or 'postal' in question_text:
+                        fill_value = user_profile.get('zip_code', '')
+                    elif 'linkedin' in question_text:
+                        fill_value = user_profile.get('linkedin_url', '')
+                    elif 'github' in question_text:
+                        fill_value = user_profile.get('github_url', '')
+                    elif 'portfolio' in question_text or 'website' in question_text:
+                        fill_value = user_profile.get('portfolio_url', '') or user_profile.get('website', '')
+                    elif any(x in question_text for x in ['current title', 'job title', 'current position', 'designation']):
+                        fill_value = user_profile.get('current_title', '')
+                    elif any(x in question_text for x in ['current company', 'company name', 'employer', 'current employer']):
+                        fill_value = user_profile.get('current_company', '')
+                    elif 'twitter' in question_text or 'x.com' in question_text:
+                        fill_value = ''  # Skip twitter
+                    elif 'facebook' in question_text:
+                        fill_value = ''  # Skip facebook
+                    
+                    # Numeric validation error fallback — use overall experience or 1
+                    if not fill_value:
+                        error_nearby = await section.query_selector('[class*="error"], .artdeco-inline-feedback--error')
+                        if error_nearby:
+                            error_text = await error_nearby.text_content() or ''
+                            if 'decimal' in error_text.lower() or 'number' in error_text.lower() or 'larger than' in error_text.lower():
+                                fill_value = str(user_profile.get('years_experience', '1')) if user_profile.get('years_experience') else '1'
+                    
+                    if fill_value and str(fill_value).strip():
+                        await inp.clear()
+                        await inp.fill(str(fill_value))
+                        await inp.press('Tab')
+                        filled_count += 1
+                        print(f"    [Q&A] {question_text[:40]}: {str(fill_value)[:15]}")
+                
+                # ---- TEXTAREAS (skill set, cover letter, etc.) ----
+                textarea = await section.query_selector('textarea')
+                if textarea:
+                    ta_value = await textarea.input_value() or ''
+                    if not ta_value.strip():
+                        ta_fill = None
+                        if any(x in question_text for x in ['skill', 'skills', 'skill set', 'expertise', 'technologies']):
+                            ta_fill = user_profile.get('skill_set', '') or user_profile.get('skills', '')
+                        elif any(x in question_text for x in ['cover letter', 'why', 'about you', 'summary', 'describe']):
+                            ta_fill = user_profile.get('cover_letter', '')
+                        elif 'additional' in question_text or 'other' in question_text or 'comment' in question_text:
+                            ta_fill = 'N/A'
+                        if ta_fill and str(ta_fill).strip():
+                            await textarea.fill(str(ta_fill))
+                            filled_count += 1
+                            print(f"    [Q&A TEXTAREA] {question_text[:35]}: {str(ta_fill)[:25]}")
+
+                # ---- NATIVE SELECTS ----
+                select = await section.query_selector('select')
+                if select:
+                    current_value = await select.input_value() or ''
+                    if current_value.strip():
+                        continue
+                    
+                    options = await select.query_selector_all('option')
+                    target_value = await _pick_dropdown_value(question_text, options, user_profile)
+                    
+                    if target_value:
+                        await select.select_option(target_value)
+                        filled_count += 1
+                        print(f"    [Q&A SELECT] {question_text[:35]}")
+                
+                # ---- CUSTOM LINKEDIN DROPDOWNS (listbox/aria) ----
+                custom_trigger = await section.query_selector(
+                    'button[aria-haspopup="listbox"], [role="combobox"], .artdeco-dropdown__trigger'
+                )
+                if custom_trigger:
+                    current_text = (await custom_trigger.text_content() or '').strip()
+                    if current_text and current_text.lower() not in ['select an option', 'select', 'choose', '', '--']:
+                        continue
+                    
+                    await custom_trigger.click()
+                    await page.wait_for_timeout(200)
+                    
+                    # Find visible listbox (can't use :visible in query_selector)
+                    listbox = None
+                    for lb in await page.query_selector_all('[role="listbox"]'):
+                        try:
+                            if await lb.is_visible():
+                                listbox = lb
+                                break
+                        except:
+                            pass
+                    if listbox:
+                        option_elems = await listbox.query_selector_all('[role="option"]')
+                        
+                        # Smart matching: determine best option based on question context
+                        chosen = None
+                        
+                        # Yes/No type questions
+                        if any(x in question_text for x in ['authorized', 'sponsor', 'relocate', 'willing', 'legally',
+                                                              'do you', 'have you', 'are you', 'can you']):
+                            desired = _resolve_yes_no_answer(question_text, user_profile)
+                            for opt_elem in option_elems:
+                                opt_text = (await opt_elem.text_content() or '').strip().lower()
+                                if opt_text == desired:
+                                    chosen = opt_elem
+                                    break
+                        
+                        # Salutation dropdown
+                        elif 'salutation' in question_text or question_text.strip() == 'title' or 'prefix' in question_text:
+                            gender = (user_profile.get('gender', '') or '').lower()
+                            prefer = 'mr' if gender in ('male', 'm', '') else 'ms'
+                            for opt_elem in option_elems:
+                                opt_text = (await opt_elem.text_content() or '').strip().lower()
+                                if prefer in opt_text:
+                                    chosen = opt_elem
+                                    break
+                        
+                        # Country dropdown
+                        elif 'country' in question_text and 'code' not in question_text:
+                            country_val = (user_profile.get('country', '') or '').lower()
+                            if country_val:
+                                for opt_elem in option_elems:
+                                    opt_text = (await opt_elem.text_content() or '').strip().lower()
+                                    if country_val in opt_text:
+                                        chosen = opt_elem
+                                        break
+                        
+                        # Current Job Title / Designation
+                        elif any(x in question_text for x in ['current title', 'job title', 'current position', 'designation']):
+                            title_val = (user_profile.get('current_title', '') or '').lower()
+                            if title_val:
+                                for opt_elem in option_elems:
+                                    opt_text = (await opt_elem.text_content() or '').strip().lower()
+                                    if title_val in opt_text or opt_text in title_val:
+                                        chosen = opt_elem
+                                        break
+                        
+                        # Experience range
+                        elif 'experience' in question_text or 'years' in question_text:
+                            import re
+                            yrs = user_profile.get('years_experience', '')
+                            if yrs:
+                                yrs_int = int(str(yrs)) if str(yrs).isdigit() else 0
+                                for opt_elem in option_elems:
+                                    opt_text = (await opt_elem.text_content() or '').strip().lower()
+                                    nums = re.findall(r'\d+', opt_text)
+                                    if nums:
+                                        lo = int(nums[0])
+                                        hi = int(nums[-1]) if len(nums) > 1 else lo + 2
+                                        if lo <= yrs_int <= hi:
+                                            chosen = opt_elem
+                                            break
+                        
+                        # Fallback: first option
+                        if not chosen and option_elems:
+                            chosen = option_elems[0]
+                        
+                        if chosen:
+                            await chosen.click()
+                            filled_count += 1
+                            opt_text = (await chosen.text_content() or '').strip()
+                            print(f"    [Q&A CUSTOM-DD] {question_text[:30]}: {opt_text[:15]}")
+                        else:
+                            await page.keyboard.press('Escape')
+                    else:
+                        await page.keyboard.press('Escape')
+                
+            except Exception:
+                continue
+        
+        # Scan for remaining empty inputs with validation errors
+        error_inputs = await page.query_selector_all('.artdeco-inline-feedback--error')
+        for error_elem in error_inputs:
+            try:
+                error_text = await error_elem.text_content() or ''
+                if 'decimal' in error_text.lower() or 'number' in error_text.lower():
+                    parent = await error_elem.evaluate_handle('el => el.closest(".fb-dash-form-element, .jobs-easy-apply-form-section__grouping")')
+                    if parent:
+                        inp = await parent.as_element().query_selector('input')
+                        if inp:
+                            current = await inp.input_value() or ''
+                            if not current.strip():
+                                val = str(user_profile.get('years_experience', '1')) if user_profile.get('years_experience') else '1'
+                                await inp.fill(val)
+                                await inp.press('Tab')
+                                filled_count += 1
+            except:
+                continue
+        
+        if filled_count > 0:
+            print(f"    [Q&A] Filled {filled_count} question fields")
+            
+    except Exception as e:
+        print(f"  [Q&A] Error: {str(e)[:40]}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python playwright_runner.py <config_json>")
+        sys.exit(1)
+    
+    config_json = sys.argv[1]
+    
+    # Run the automation
+    result = asyncio.run(run_automation(config_json))
+    
+    # Output result as JSON
+    print("\n===RESULT_JSON===")
+    print(json.dumps(result, indent=2))

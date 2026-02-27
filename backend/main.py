@@ -6,6 +6,14 @@ import sys
 import asyncio
 from pathlib import Path
 
+# Windows-specific: Fix UTF-8 encoding for stdout/stderr so emoji print() calls
+# in imported modules do not raise UnicodeEncodeError (cp1252 default on Windows).
+# This MUST run before any module that prints emoji characters is imported.
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 # Windows-specific: Ensure ProactorEventLoop is used for subprocess compatibility
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -91,12 +99,22 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         msg = e.get("msg", "Invalid request")
         errors.append(f"{field}: {msg}" if field else msg)
 
+    # Make detail JSON-serializable (pydantic may include bytes in 'input')
+    def _make_serializable(obj):
+        if isinstance(obj, bytes):
+            return obj.decode("utf-8", errors="replace")
+        if isinstance(obj, dict):
+            return {k: _make_serializable(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_make_serializable(i) for i in obj]
+        return obj
+
     return JSONResponse(
         status_code=422,
         content={
             "message": "Request validation failed",
             "errors": errors,
-            "detail": exc.errors(),
+            "detail": _make_serializable(exc.errors()),
         },
     )
 

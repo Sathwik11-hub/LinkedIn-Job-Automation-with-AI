@@ -82,13 +82,13 @@ class IntelligentFormFiller:
             # Sponsorship
             'sponsorship': {
                 'patterns': ['require sponsorship', 'need sponsorship', 'visa sponsorship'],
-                'answer': self.user_profile.get('requires_sponsorship', 'No')
+                'answer': self.user_profile.get('sponsorship', self.user_profile.get('requires_sponsorship', 'No'))
             },
 
             # Will you now or in the future require sponsorship?
             'sponsorship_future': {
                 'patterns': ['now or in the future require sponsorship', 'future sponsorship', 'require visa sponsorship'],
-                'answer': self.user_profile.get('requires_sponsorship', 'No')
+                'answer': self.user_profile.get('sponsorship', self.user_profile.get('requires_sponsorship', 'No'))
             },
 
             # Are you at least 18 years old?
@@ -97,10 +97,10 @@ class IntelligentFormFiller:
                 'answer': 'Yes'
             },
             
-            # Years of experience
+            # Years of experience — use profile value, no hardcoded fallback
             'years_experience': {
                 'patterns': ['years of experience', 'years experience', 'how many years'],
-                'answer': self.user_profile.get('years_experience', '3')
+                'answer': self.user_profile.get('years_experience', '')
             },
             
             # Start date
@@ -118,13 +118,13 @@ class IntelligentFormFiller:
             # Notice period
             'notice_period': {
                 'patterns': ['notice period', 'current notice', 'how much notice'],
-                'answer': self.user_profile.get('notice_period', '2 weeks')
+                'answer': self.user_profile.get('notice_period', '')
             },
             
             # Relocation
             'relocation': {
                 'patterns': ['willing to relocate', 'open to relocation', 'relocate'],
-                'answer': self.user_profile.get('willing_to_relocate', 'Yes')
+                'answer': 'Yes' if str(self.user_profile.get('relocate', self.user_profile.get('willing_to_relocate', 'Yes'))).lower() in ['yes', 'true', '1', 'y'] else 'No'
             },
             
             # Remote work
@@ -168,9 +168,13 @@ class IntelligentFormFiller:
             textarea_filled = await self._fill_textareas()
             filled_fields += textarea_filled
             
-            # Select dropdowns
+            # Select dropdowns (native <select>)
             dropdown_filled = await self._fill_dropdowns()
             filled_fields += dropdown_filled
+            
+            # LinkedIn custom dropdowns (listbox/aria)
+            custom_dd_filled = await self._fill_linkedin_custom_dropdowns()
+            filled_fields += custom_dd_filled
             
             # Select radio buttons
             radio_filled = await self._fill_radio_buttons()
@@ -316,6 +320,80 @@ class IntelligentFormFiller:
         
         except Exception as e:
             print(f"   ⚠️  Error processing dropdowns: {str(e)}")
+        
+        return filled
+    
+    async def _fill_linkedin_custom_dropdowns(self) -> int:
+        """Fill LinkedIn-style custom dropdowns (aria listbox pattern)."""
+        filled = 0
+        
+        try:
+            triggers = await self.page.query_selector_all(
+                'button[aria-haspopup="listbox"]:visible, '
+                '[role="combobox"]:visible, '
+                '.artdeco-dropdown__trigger:visible'
+            )
+            
+            for trigger in triggers:
+                try:
+                    current_text = (await trigger.inner_text()).strip()
+                    if current_text and current_text.lower() not in ['select an option', 'select', 'choose', '', '--']:
+                        continue
+                    
+                    # Get section label
+                    label = await self._get_field_label(trigger)
+                    label_lower = label.lower()
+                    
+                    # Click to open
+                    await trigger.click()
+                    await asyncio.sleep(0.4)
+                    
+                    listbox = await self.page.query_selector('[role="listbox"]:visible')
+                    if not listbox:
+                        await self.page.keyboard.press('Escape')
+                        continue
+                    
+                    option_elems = await listbox.query_selector_all('[role="option"]')
+                    if not option_elems:
+                        await self.page.keyboard.press('Escape')
+                        continue
+                    
+                    # Determine desired answer
+                    desired = None
+                    for field_name, field_info in self.smart_defaults.items():
+                        if any(p in label_lower for p in field_info['patterns']):
+                            desired = str(field_info['answer']).lower()
+                            break
+                    
+                    chosen = None
+                    if desired:
+                        for opt_elem in option_elems:
+                            opt_text = (await opt_elem.inner_text()).strip().lower()
+                            if opt_text == desired or desired in opt_text:
+                                chosen = opt_elem
+                                break
+                    
+                    if not chosen and option_elems:
+                        chosen = option_elems[0]
+                    
+                    if chosen:
+                        await chosen.click()
+                        await asyncio.sleep(0.3)
+                        filled += 1
+                        opt_text = (await chosen.inner_text()).strip()
+                        print(f"   ✓ Custom dropdown: {label[:50]} = {opt_text[:30]}")
+                    else:
+                        await self.page.keyboard.press('Escape')
+                        
+                except Exception:
+                    try:
+                        await self.page.keyboard.press('Escape')
+                    except:
+                        pass
+                    continue
+        
+        except Exception as e:
+            print(f"   ⚠️  Error processing LinkedIn custom dropdowns: {str(e)}")
         
         return filled
     
@@ -468,15 +546,12 @@ class IntelligentFormFiller:
             return ""
     
     def _get_smart_value_for_field(self, label: str, placeholder: str, field_type: str) -> Any:
-        """Get smart value for a field based on label/placeholder"""
+        """Get smart value for a field based on label/placeholder.
+        Priority: user_profile > resume extraction > smart_defaults > None (skip).
+        """
         label_lower = (label + " " + placeholder).lower()
         
-        # Check smart defaults
-        for field_name, field_info in self.smart_defaults.items():
-            if any(pattern in label_lower for pattern in field_info['patterns']):
-                return field_info['answer']
-        
-        # Field-specific matching
+        # Field-specific matching first (user profile data)
         if 'first name' in label_lower:
             return self.user_profile.get('first_name', '')
         elif 'last name' in label_lower:
@@ -487,12 +562,29 @@ class IntelligentFormFiller:
             return self.user_profile.get('phone_number', '') or self.user_profile.get('phone', '')
         elif 'city' in label_lower or 'location' in label_lower:
             return self.user_profile.get('city', '')
-        elif 'linkedin' in label_lower and 'url' in label_lower:
+        elif 'state' in label_lower or 'province' in label_lower:
+            return self.user_profile.get('state', '')
+        elif 'zip' in label_lower or 'postal' in label_lower:
+            return self.user_profile.get('zip_code', '')
+        elif 'linkedin' in label_lower:
             return self.user_profile.get('linkedin_url', '')
-        elif 'github' in label_lower or 'portfolio' in label_lower:
+        elif 'github' in label_lower:
             return self.user_profile.get('github_url', '')
-        elif 'website' in label_lower:
-            return self.user_profile.get('website', '')
+        elif 'portfolio' in label_lower or 'website' in label_lower:
+            return self.user_profile.get('portfolio_url', '') or self.user_profile.get('website', '')
+        
+        # Skill-specific experience
+        skill_exp = self.user_profile.get('skill_experience', {})
+        for skill, years in skill_exp.items():
+            if skill.lower() in label_lower:
+                return str(years)
+        
+        # Check smart defaults
+        for field_name, field_info in self.smart_defaults.items():
+            if any(pattern in label_lower for pattern in field_info['patterns']):
+                val = field_info['answer']
+                if val:  # Only return non-empty answers
+                    return val
         
         return None
     

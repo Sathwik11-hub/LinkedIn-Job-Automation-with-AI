@@ -31,6 +31,7 @@ interface AutomationFormData {
   workAuthorizationUs: string;
   requireSponsorship: string;
   willingToRelocate: string;
+  skillSet: string;
   dryRun: boolean;
   headless: boolean;
   resume: File | null;
@@ -59,6 +60,8 @@ interface ApplicationResult {
   matchScore: number;
 }
 
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || import.meta.env.VITE_API_URL || 'http://localhost:8000';
+
 export default function LinkedInAutomation() {
   const { toast } = useToast();
   const [formData, setFormData] = useState<AutomationFormData>({
@@ -85,6 +88,7 @@ export default function LinkedInAutomation() {
     workAuthorizationUs: 'Yes',
     requireSponsorship: 'No',
     willingToRelocate: 'Yes',
+    skillSet: '',
     dryRun: false,  // CHANGED: Default to false to actually submit applications
     headless: false,
     resume: null
@@ -158,6 +162,7 @@ export default function LinkedInAutomation() {
       apiFormData.append('max_applications', formData.maxApplications.toString());
       apiFormData.append('first_name', formData.firstName);
       apiFormData.append('last_name', formData.lastName);
+      apiFormData.append('phone', formData.phone);
       apiFormData.append('phone_number', formData.phone);
       apiFormData.append('email', formData.email);
       apiFormData.append('city', formData.city);
@@ -171,9 +176,18 @@ export default function LinkedInAutomation() {
       apiFormData.append('current_company', formData.currentCompany || '');
       apiFormData.append('current_title', formData.currentTitle || '');
       apiFormData.append('years_experience', formData.yearsExperience);
+      apiFormData.append('skill_set', formData.skillSet || '');
       apiFormData.append('work_authorization_us', formData.workAuthorizationUs);
       apiFormData.append('require_sponsorship', formData.requireSponsorship);
       apiFormData.append('willing_to_relocate', formData.willingToRelocate);
+
+      // Debug: log all form data being sent
+      console.log('[AUTOMATION] Form data being sent:');
+      for (const [key, value] of apiFormData.entries()) {
+        if (key !== 'linkedin_password' && key !== 'resume') {
+          console.log(`  ${key}: ${value}`);
+        }
+      }
       apiFormData.append('dry_run', formData.dryRun.toString());
       apiFormData.append('headless', formData.headless.toString());
       
@@ -181,7 +195,7 @@ export default function LinkedInAutomation() {
         apiFormData.append('resume', formData.resume);
       }
 
-      const response = await fetch('http://127.0.0.1:8000/api/v2/start-automation', {
+      const response = await fetch(`${API_BASE_URL}/api/v2/start-automation`, {
         method: 'POST',
         body: apiFormData
       });
@@ -214,7 +228,7 @@ export default function LinkedInAutomation() {
   const pollStatus = async (sid: string) => {
     const interval = setInterval(async () => {
       try {
-        const response = await fetch(`http://localhost:8000/api/v2/automation-status/${sid}`);
+        const response = await fetch(`${API_BASE_URL}/api/v2/automation-status/${sid}`);
         const data = await response.json();
         
         setStatus(data);
@@ -224,7 +238,7 @@ export default function LinkedInAutomation() {
           setIsRunning(false);
 
           if (data.status === 'completed') {
-            const resultsResponse = await fetch(`http://localhost:8000/api/v2/automation-results/${sid}`);
+            const resultsResponse = await fetch(`${API_BASE_URL}/api/v2/automation-results/${sid}`);
             const resultsData = await resultsResponse.json();
             setResults(resultsData.results);
             setShowResults(true);
@@ -249,12 +263,23 @@ export default function LinkedInAutomation() {
 
   const getPhaseText = (phase: string) => {
     const phases: Record<string, string> = {
+      'setup': 'Setting up...',
+      'initializing': 'Initializing...',
+      'subprocess_started': 'Starting automation engine...',
+      'browser_initialized': 'Browser initialized',
       'browser_init': 'Initializing browser...',
+      'logged_in': 'Logged into LinkedIn',
       'login': 'Logging into LinkedIn...',
+      'logging_in': 'Logging into LinkedIn...',
+      'searching': 'Searching for jobs...',
       'searching_jobs': 'Searching for jobs...',
+      'jobs_collected': 'Jobs collected!',
       'collecting_jobs': 'Collecting job listings...',
       'applying': 'Applying to jobs...',
-      'done': 'Completed!'
+      'completed': 'Completed!',
+      'finished': 'Completed!',
+      'done': 'Completed!',
+      'no_jobs_found': 'No jobs found matching criteria',
     };
     return phases[phase] || phase;
   };
@@ -427,6 +452,69 @@ export default function LinkedInAutomation() {
                   value={formData.yearsExperience}
                   onChange={handleInputChange}
                   required
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4 mt-4">
+              <div>
+                <Label htmlFor="country">Country</Label>
+                <Input
+                  id="country"
+                  name="country"
+                  value={formData.country}
+                  onChange={handleInputChange}
+                  placeholder="United States"
+                />
+              </div>
+              <div>
+                <Label htmlFor="address">Street Address</Label>
+                <Input
+                  id="address"
+                  name="address"
+                  value={formData.address}
+                  onChange={handleInputChange}
+                  placeholder="123 Main St"
+                />
+              </div>
+              <div>
+                <Label htmlFor="linkedinUrl">LinkedIn URL</Label>
+                <Input
+                  id="linkedinUrl"
+                  name="linkedinUrl"
+                  value={formData.linkedinUrl}
+                  onChange={handleInputChange}
+                  placeholder="https://linkedin.com/in/yourprofile"
+                />
+              </div>
+              <div>
+                <Label htmlFor="currentTitle">Current Job Title</Label>
+                <Input
+                  id="currentTitle"
+                  name="currentTitle"
+                  value={formData.currentTitle}
+                  onChange={handleInputChange}
+                  placeholder="Software Engineer"
+                />
+              </div>
+              <div>
+                <Label htmlFor="currentCompany">Current Company</Label>
+                <Input
+                  id="currentCompany"
+                  name="currentCompany"
+                  value={formData.currentCompany}
+                  onChange={handleInputChange}
+                  placeholder="Company name"
+                />
+              </div>
+              <div>
+                <Label htmlFor="skillSet">Skill Set</Label>
+                <Input
+                  id="skillSet"
+                  name="skillSet"
+                  value={formData.skillSet}
+                  onChange={handleInputChange}
+                  placeholder="Python, React, AWS..."
                 />
               </div>
             </div>
