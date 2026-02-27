@@ -128,6 +128,8 @@ Desktop.ini
 # Temporary Files
 *.tmp
 *.temp
+*.bak
+*.bak2
 /tmp/
 .cache/
 

@@ -1118,7 +1118,8 @@ async def _pick_dropdown_value(label, options, profile) -> str:
             if el and el in (await o.text_content() or "").lower():
                 return await o.get_attribute("value") or ""
         for o in options:
-            if any(x in (await o.text_content() or "").lower() for x in ("bachelor", "b.tech")):
+            ot = (await o.text_content() or "").lower()
+            if any(x in ot for x in ("bachelor", "b.tech")):
                 return await o.get_attribute("value") or ""
 
     if "country" in lb and "code" not in lb:
