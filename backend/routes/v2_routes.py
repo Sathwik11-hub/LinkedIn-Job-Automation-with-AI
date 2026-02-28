@@ -13,7 +13,16 @@ from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 
-from backend.agents.autoagenthire_bot import AutoAgentHireBot
+# Heavy bot import is deferred to first request to avoid slowing server startup
+AutoAgentHireBot = None
+
+def _get_bot_class():
+    """Lazy-load AutoAgentHireBot on first use."""
+    global AutoAgentHireBot
+    if AutoAgentHireBot is None:
+        from backend.agents.autoagenthire_bot import AutoAgentHireBot as _Bot
+        AutoAgentHireBot = _Bot
+    return AutoAgentHireBot
 
 # Database imports
 engine = None
@@ -604,7 +613,7 @@ async def run_automation_v2(session_id: str, config: dict):
         print(f"Max applications: {config.get('max_applications')}")
         print(f"Dry run: {config.get('dry_run')}")
         
-        bot = AutoAgentHireBot(config)
+        bot = _get_bot_class()(config)
         
         if config.get("resume_path"):
             try:

@@ -39,14 +39,24 @@ import uvicorn
 from config import settings
 from backend.routes.api_routes import router as api_router
 from backend.routes.linkedin_jobs_routes import router as linkedin_jobs_router
-from backend.routes.agent_routes import router as agent_router
 from backend.routes.ats_routes import router as ats_router
 from backend.routes.cover_letter_routes import router as cover_letter_router
 from backend.api.autoagenthire import router as autoagenthire_router
-from backend.routes.v2_routes import router as v2_router
 from backend.routes.auth_routes import router as auth_router
 from backend.database.connection import init_db
-# from backend.utils.logger import setup_logger
+
+# Heavy agent/ML routes — imported lazily so a missing dep doesn't break startup
+agent_router = None
+v2_router = None
+try:
+    from backend.routes.agent_routes import router as agent_router
+except Exception as _e:
+    print(f"[WARN] agent_routes not loaded: {_e}")
+
+try:
+    from backend.routes.v2_routes import router as v2_router
+except Exception as _e:
+    print(f"[WARN] v2_routes not loaded: {_e}")
 
 # Setup logger
 # logger = setup_logger(__name__)
@@ -134,11 +144,13 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.include_router(auth_router)
 app.include_router(api_router)
 app.include_router(linkedin_jobs_router)
-app.include_router(agent_router)
+if agent_router is not None:
+    app.include_router(agent_router)
 app.include_router(ats_router)
 app.include_router(cover_letter_router)
 app.include_router(autoagenthire_router)
-app.include_router(v2_router)  # V2 API for frontend
+if v2_router is not None:
+    app.include_router(v2_router)  # V2 API for frontend
 
 
 # Health check endpoint

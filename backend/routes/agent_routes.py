@@ -6,7 +6,7 @@ FastAPI endpoints for running the autonomous agent workflow.
 
 import asyncio
 import logging
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from datetime import datetime
 from pathlib import Path
 
@@ -17,20 +17,49 @@ from sqlalchemy.orm import Session
 
 from backend.database.connection import get_db
 from backend.database import crud
-from backend.agents.multi_agent_orchestrator import MultiAgentOrchestrator
-from backend.agents.langgraph_orchestrator import get_orchestrator as get_langgraph_orchestrator
 from backend.agents.graph_state import AgentInput, AgentOutput
-from backend.agents.browser_adapter import create_browser_automation
-from backend.rag.resume_intelligence import ResumeIntelligence
 from backend.config import settings
 import os
+
+# Heavy ML/agent imports deferred to avoid slow server startup
+_MultiAgentOrchestrator = None
+_get_langgraph_orchestrator = None
+_create_browser_automation = None
+_ResumeIntelligence = None
+
+def _load_heavy_deps():
+    global _MultiAgentOrchestrator, _get_langgraph_orchestrator, _create_browser_automation, _ResumeIntelligence
+    if _MultiAgentOrchestrator is None:
+        try:
+            from backend.agents.multi_agent_orchestrator import MultiAgentOrchestrator
+            _MultiAgentOrchestrator = MultiAgentOrchestrator
+        except Exception as e:
+            logger.warning(f"MultiAgentOrchestrator unavailable: {e}")
+    if _get_langgraph_orchestrator is None:
+        try:
+            from backend.agents.langgraph_orchestrator import get_orchestrator
+            _get_langgraph_orchestrator = get_orchestrator
+        except Exception as e:
+            logger.warning(f"langgraph_orchestrator unavailable: {e}")
+    if _create_browser_automation is None:
+        try:
+            from backend.agents.browser_adapter import create_browser_automation
+            _create_browser_automation = create_browser_automation
+        except Exception as e:
+            logger.warning(f"browser_adapter unavailable: {e}")
+    if _ResumeIntelligence is None:
+        try:
+            from backend.rag.resume_intelligence import ResumeIntelligence
+            _ResumeIntelligence = ResumeIntelligence
+        except Exception as e:
+            logger.warning(f"ResumeIntelligence unavailable: {e}")
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
 # Global orchestrator instances (keyed by run_id)
-active_orchestrators: Dict[str, MultiAgentOrchestrator] = {}
+active_orchestrators: Dict[str, Any] = {}
 
 
 # ===========================
@@ -82,7 +111,7 @@ class UploadResumeResponse(BaseModel):
 # ===========================
 
 async def run_agent_workflow_background(
-    orchestrator: MultiAgentOrchestrator,
+    orchestrator: Any,
     run_id: str,
     user_id: str,
     resume_file_path: str,
@@ -196,12 +225,15 @@ async def run_agent(
             'similarity_threshold': request.similarity_threshold
         })
         
-        # Initialize components
-        resume_intelligence = ResumeIntelligence(
+        # Initialize components (lazy-load heavy deps on first request)
+        _load_heavy_deps()
+        if not _MultiAgentOrchestrator or not _ResumeIntelligence or not _create_browser_automation:
+            raise HTTPException(status_code=503, detail="Agent components not available")
+        resume_intelligence = _ResumeIntelligence(
             openai_api_key=settings.OPENAI_API_KEY or os.getenv("OPENAI_API_KEY")
         )
         
-        browser_automation = create_browser_automation({
+        browser_automation = _create_browser_automation({
             'linkedin_email': request.linkedin_email or settings.LINKEDIN_EMAIL or os.getenv("LINKEDIN_EMAIL"),
             'linkedin_password': request.linkedin_password or settings.LINKEDIN_PASSWORD or os.getenv("LINKEDIN_PASSWORD"),
             'auto_apply': True,
@@ -209,7 +241,7 @@ async def run_agent(
         })
         
         # Create orchestrator
-        orchestrator = MultiAgentOrchestrator(
+        orchestrator = _MultiAgentOrchestrator(
             resume_intelligence=resume_intelligence,
             browser_automation=browser_automation,
             similarity_threshold=request.similarity_threshold
@@ -353,7 +385,10 @@ async def upload_resume(
         
         # Parse resume
         try:
-            resume_intelligence = ResumeIntelligence()
+            _load_heavy_deps()
+            if not _ResumeIntelligence:
+                raise RuntimeError("ResumeIntelligence not available")
+            resume_intelligence = _ResumeIntelligence()
             resume_data = resume_intelligence.parse_resume_file(str(file_path))
             
             # Get or create user
@@ -528,7 +563,10 @@ async def run_langgraph_workflow(request: LangGraphRunRequest):
         }
         
         # Get orchestrator and run workflow
-        orchestrator = get_langgraph_orchestrator()
+        _load_heavy_deps()
+        if not _get_langgraph_orchestrator:
+            raise HTTPException(status_code=503, detail="LangGraph orchestrator not available")
+        orchestrator = _get_langgraph_orchestrator()
         result: AgentOutput = orchestrator.run_sync(agent_input)
         
         logger.info(
@@ -548,7 +586,10 @@ async def run_langgraph_workflow(request: LangGraphRunRequest):
 async def langgraph_health():
     """Check if LangGraph orchestrator is initialized"""
     try:
-        orchestrator = get_langgraph_orchestrator()
+        _load_heavy_deps()
+        if not _get_langgraph_orchestrator:
+            raise RuntimeError("Not loaded")
+        orchestrator = _get_langgraph_orchestrator()
         return {
             "status": "healthy",
             "orchestrator_initialized": True,
