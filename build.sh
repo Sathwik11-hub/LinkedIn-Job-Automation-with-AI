@@ -10,4 +10,7 @@ echo "Installing Playwright browsers..."
 playwright install chromium
 playwright install-deps chromium
 
+echo "Creating required directories..."
+mkdir -p data/logs data/resumes data/job_listings uploads
+
 echo "Build complete!"
