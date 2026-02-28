@@ -10,7 +10,7 @@ services:
       - key: PYTHON_VERSION
         value: "3.11.11"
       - key: PLAYWRIGHT_BROWSERS_PATH
-        value: "/opt/render/project/.cache/ms-playwright"
+        value: "/opt/render/.cache/ms-playwright"
       - key: APP_ENV
         value: "production"
       - key: DEBUG
