@@ -1,350 +1,358 @@
-# AutoAgent Hire — LinkedIn Job Automation with AI
+ï»¿ðŸš€ AutoAgent Hire â€“ LinkedIn Job Automation with AI
 
-> Autonomous AI agent that discovers, fills, and submits LinkedIn Easy Apply jobs on your behalf.
+Autonomous AI agent that discovers, fills, and submits LinkedIn Easy Apply jobs intelligently on your behalf.
 
-[![Backend](https://img.shields.io/badge/Backend-FastAPI%20%2B%20Python%203.11-009688?logo=fastapi)](https://fastapi.tiangolo.com)
-[![Frontend](https://img.shields.io/badge/Frontend-React%20%2B%20Vite%20%2B%20TypeScript-61dafb?logo=react)](https://vitejs.dev)
-[![Automation](https://img.shields.io/badge/Automation-Playwright%20Chromium-45ba4b?logo=playwright)](https://playwright.dev)
-[![Deploy](https://img.shields.io/badge/Deploy-Render%20%2B%20Vercel-430098?logo=render)](https://render.com)
+ðŸŒŸ Quick Overview
 
----
+AutoAgent Hire is a full-stack AI automation system that:
 
-## Table of Contents
+Logs into LinkedIn using a persistent browser profile
 
-- [Features](#features)
-- [Architecture](#architecture)
-- [Project Structure](#project-structure)
-- [How It Works](#how-it-works)
-- [Local Development](#local-development)
-- [Deployment](#deployment)
-- [API Reference](#api-reference)
-- [Troubleshooting](#troubleshooting)
-- [License](#license)
+Finds Easy Apply jobs based on keywords & location
 
----
+Fills multi-step application forms automatically
 
-## Features
+Uses AI to answer unknown/custom fields
 
-- **AI-Powered Form Filling** — Unknown / custom fields answered by AI (GitHub Models ? Groq ? OpenAI fallback with automatic provider detection)
-- **Multi-Step Easy Apply** — Handles unlimited form pages with smart Next/Submit detection
-- **Field Deduplication** — Each field filled at most once; AI called at most once per label
-- **Save-Popup Protection** — Detects and dismisses LinkedIn's "Save this application?" dialog automatically
-- **Resume Parsing** — Extracts skills and experience from uploaded PDF/DOCX to prefill forms
-- **India-Specific Field Support** — 10th/12th %, College, DOB, Graduation Year, Hometown, CGPA
-- **Persistent Browser Profile** — Stays logged in across sessions
-- **Dry-Run Mode** — Preview without actually submitting
-- **Real-Time Progress** — Frontend polls live status, phase, and per-job results
-- **Full Auth System** — JWT-based signup/login, user profiles stored in PostgreSQL
+Uploads resume dynamically
 
----
+Submits applications (or runs in dry-run mode)
 
-## Architecture
+Tracks results in real-time
 
-```
+Stores user profiles securely in PostgreSQL
+
+Built with FastAPI, Playwright, React, Supabase, and modern AI APIs.
+
+ðŸ— Architecture
 +---------------------------------------------------------+
-¦                    USER BROWSER                         ¦
-¦         React + Vite + Tailwind (frontend/lovable)      ¦
-¦              Hosted on Vercel (static)                  ¦
+|                    USER BROWSER                         |
+|     React + Vite + TypeScript (Frontend - Vercel)      |
 +---------------------------------------------------------+
-                           ¦ HTTP REST
-+--------------------------?------------------------------+
-¦                 FastAPI Backend (Python 3.11)            ¦
-¦                  Hosted on Render                       ¦
-¦                                                         ¦
-¦  +--------------+  +--------------+  +--------------+  ¦
-¦  ¦  Auth Routes ¦  ¦  V2 Routes   ¦  ¦  Agent API   ¦  ¦
-¦  ¦  JWT + bcrypt¦  ¦  Automation  ¦  ¦  LangGraph   ¦  ¦
-¦  +--------------+  +--------------+  +--------------+  ¦
-¦                           ¦ subprocess (Windows-safe)    ¦
-¦  +------------------------?------------------------+    ¦
-¦  ¦           playwright_runner.py                   ¦    ¦
-¦  ¦  • Field mapping + AI fallback                   ¦    ¦
-¦  ¦  • FieldTracker (no re-fills)                    ¦    ¦
-¦  ¦  • Multi-step Easy Apply loop                    ¦    ¦
-¦  ¦  • Save-popup dismissal                          ¦    ¦
-¦  +-------------------------------------------------+    ¦
-¦                                                         ¦
-¦  PostgreSQL (Supabase)    AI Providers (auto-detected)  ¦
-¦  SQLAlchemy models        GitHub Models ? Groq ? OpenAI ¦
+                          | HTTP REST
 +---------------------------------------------------------+
-```
+|                 FastAPI Backend (Render)                |
+|                                                         |
+|  +-------------+  +-------------+  +----------------+  |
+|  |  Auth (JWT) |  | Automation  |  |   AI Engine    |  |
+|  | bcrypt      |  | Playwright  |  | Multi-provider |  |
+|  +-------------+  +-------------+  +----------------+  |
+|                                                         |
+|   PostgreSQL (Supabase)     AI Providers (Cloud APIs)  |
++---------------------------------------------------------+
+ðŸ§  Core Features
+ðŸ¤– AI-Powered Form Filling
 
-| Layer | Technology | Hosting |
-|-------|-----------|---------|
-| Frontend | React + Vite (TypeScript) | Vercel |
-| Backend API | FastAPI + Python 3.11 | Render |
-| Database | PostgreSQL | Supabase |
-| Browser Automation | Playwright Chromium (subprocess) | Render |
-| AI / LLM | GitHub Models / Groq / OpenAI | Cloud APIs |
+Automatically fills known fields from user profile
 
----
+Uses AI fallback for unknown/custom fields
 
-## Project Structure
+AI called only once per unique label
 
-```
+Smart provider detection:
+
+GitHub Models (preferred)
+
+Groq (fallback)
+
+OpenAI (final fallback)
+
+ðŸ”„ Multi-Step Easy Apply Engine
+
+Handles unlimited form pages
+
+Smart Next / Review / Submit detection
+
+Validation error re-check
+
+Resume upload support
+
+Safe exit if form gets stuck
+
+ðŸ§¾ Resume Intelligence
+
+Parses PDF/DOCX
+
+Extracts:
+
+Skills
+
+Experience
+
+Education
+
+Summary
+
+Used for:
+
+Field prefill
+
+AI contextual answers
+
+Job matching
+
+ðŸ›¡ FieldTracker Protection
+
+Prevents duplicate field filling
+
+Prevents infinite loops
+
+Prevents repeated AI calls
+
+Each field processed once
+
+ðŸ§‘â€ðŸ’» Full Authentication System
+
+Signup / Login
+
+JWT authentication
+
+Password hashing using bcrypt
+
+User profile stored in PostgreSQL
+
+âš¡ Performance Optimizations
+
+Headless Chromium
+
+Explicit waits (no sleep-based logic)
+
+Field deduplication
+
+AI caching
+
+Subprocess-based automation isolation
+
+ðŸ“ Project Structure
 LinkedIn-Job-Automation-with-AI/
-¦
-+-- backend/                        # All Python backend code
-¦   +-- agents/                     # LangGraph automation agents
-¦   ¦   +-- playwright_runner.py    ? Core Easy Apply engine (v3)
-¦   ¦   +-- autoagenthire_bot.py    ? High-level bot orchestrator
-¦   +-- api/                        # Internal API modules
-¦   +-- auth/                       # JWT auth (signup/login/middleware)
-¦   +-- automation/                 # Form filler & apply handlers
-¦   +-- config.py                   # App settings (Pydantic BaseSettings)
-¦   +-- database/                   # SQLAlchemy models, CRUD, connections
-¦   +-- llm/                        # LLM wrappers
-¦   +-- matching/                   # Resume ? job matching
-¦   +-- parsers/                    # PDF/DOCX resume parser
-¦   +-- playwright_runner.py        ? Easy Apply engine (run as subprocess)
-¦   +-- rag/                        # Resume intelligence & vector search
-¦   +-- routes/                     # FastAPI route handlers
-¦   ¦   +-- v2_routes.py            ? Main automation API (v2)
-¦   ¦   +-- auth_routes.py
-¦   ¦   +-- ...
-¦   +-- utils/                      # Shared utilities
-¦   +-- main.py                     # FastAPI app entry point
-¦
-+-- frontend/
-¦   +-- lovable/                    # React + Vite + TypeScript + Tailwind
-¦       +-- src/
-¦           +-- components/
-¦               +-- LinkedInAutomation.tsx  ? Main UI component
-¦
-+-- scripts/                        # DB init & smoke-test scripts
-+-- database/                       # SQL schema (init.sql)
-+-- docker/                         # Docker Compose + Dockerfiles
-+-- data/                           # Local data (logs, resumes, screenshots)
-+-- uploads/                        # Uploaded resumes (gitignored)
-¦
-+-- build.sh                        # Render build script
-+-- Procfile                        # Render web process
-+-- render.yaml                     # Render deploy config
-+-- requirements.txt                # Python dependencies (single source)
-+-- pyrightconfig.json              # Python type-check config
-+-- .env.example                    # Environment template
-+-- README.md
-```
-
----
-
-## How It Works
-
-### Automation Flow
-
-```
-1. User fills form in React UI (profile, resume, keywords, location)
-         ¦
+â”‚
+â”œâ”€â”€ backend/
+â”‚   â”œâ”€â”€ main.py
+â”‚   â”œâ”€â”€ core/
+â”‚   â”‚   â”œâ”€â”€ config.py
+â”‚   â”‚   â”œâ”€â”€ security.py
+â”‚   â”‚   â””â”€â”€ logging.py
+â”‚   â”œâ”€â”€ database/
+â”‚   â”‚   â”œâ”€â”€ session.py
+â”‚   â”‚   â”œâ”€â”€ models.py
+â”‚   â”‚   â””â”€â”€ crud.py
+â”‚   â”œâ”€â”€ routes/
+â”‚   â”‚   â”œâ”€â”€ auth_routes.py
+â”‚   â”‚   â””â”€â”€ automation_routes.py
+â”‚   â”œâ”€â”€ automation/
+â”‚   â”‚   â”œâ”€â”€ playwright_runner.py
+â”‚   â”‚   â”œâ”€â”€ field_mapper.py
+â”‚   â”‚   â””â”€â”€ field_tracker.py
+â”‚   â”œâ”€â”€ llm/
+â”‚   â”‚   â”œâ”€â”€ provider_manager.py
+â”‚   â”‚   â””â”€â”€ ai_fallback.py
+â”‚   â”œâ”€â”€ parsers/
+â”‚   â”‚   â””â”€â”€ resume_parser.py
+â”‚   â”œâ”€â”€ rag/
+â”‚   â””â”€â”€ utils/
+â”‚
+â”œâ”€â”€ frontend/
+â”‚   â””â”€â”€ lovable/
+â”‚       â””â”€â”€ src/
+â”‚           â”œâ”€â”€ components/
+â”‚           â””â”€â”€ pages/
+â”‚
+â”œâ”€â”€ scripts/
+â”œâ”€â”€ docker/
+â”œâ”€â”€ uploads/        (gitignored)
+â”œâ”€â”€ data/           (gitignored)
+â”œâ”€â”€ requirements.txt
+â”œâ”€â”€ render.yaml
+â”œâ”€â”€ Procfile
+â”œâ”€â”€ .env.example
+â””â”€â”€ README.md
+ðŸ”„ Automation Flow
+1. User fills profile in React UI
 2. POST /api/v2/start-automation
-   ? Backend spawns playwright_runner.py as a subprocess
-         ¦
-3. playwright_runner.py:
-   +-- Launches Chromium with persistent profile
-   +-- Logs into LinkedIn (reuses session if still valid)
-   +-- Searches: keywords + location + Easy Apply filter
-   +-- Collects up to N job cards
-   ¦
-   +-- For each job:
-       +-- Click Easy Apply button
-       +-- LOOP per form step:
-       ¦   +-- JS DOM scan ? fill known fields from profile
-       ¦   +-- AI fallback ? GitHub Models/Groq for unknown fields
-       ¦   +-- Section scan ? radios, textareas, checkboxes
-       ¦   +-- Upload resume (once)
-       ¦   +-- Validate ? re-fill if validation errors
-       ¦   +-- Click Next / Review / Submit
-       +-- On completion ? mark job APPLIED / DRY_RUN
-         ¦
-4. GET /api/v2/automation-status/{id}  ? Frontend polls this
-5. GET /api/v2/automation-results/{id} ? Frontend fetches final results
-```
+3. Backend spawns Playwright subprocess
+4. Browser:
+    - Searches Easy Apply jobs
+    - Loops through job cards
+    - Fills known fields
+    - AI handles unknown fields
+    - Uploads resume
+    - Clicks Next â†’ Submit
+5. Frontend polls status
+6. Results stored in PostgreSQL
+ðŸ§© AI Field Handling Logic
 
-### AI Field Handler
+For unknown form fields:
 
-When a form field label is not recognized by the built-in mapping:
+Extract label + context
 
-1. The field label + job title + user profile + resume excerpt are sent to the AI
-2. Provider is auto-detected: **GitHub Models** (preferred) ? **Groq** ? **OpenAI**
-3. Answer is cached — the AI is called **at most once per unique field label**
-4. If the AI returns nothing, the field is skipped gracefully
+Send to AI provider
 
----
+Receive short relevant answer
 
-## Local Development
+Cache result
 
-### Prerequisites
+Fill once
 
-- Python 3.11+
-- Node.js 18+
-- PostgreSQL (local or Supabase)
+Skip if AI returns nothing
 
-### 1. Clone & Install
+AI is never called more than once per label.
 
-```bash
-git clone https://github.com/Sathwik11-hub/LinkedIn-Job-Automation-with-AI.git
+ðŸ›  Local Development
+Requirements
+
+Python 3.11+
+
+Node.js 18+
+
+PostgreSQL (local or Supabase)
+
+Setup
+1ï¸âƒ£ Clone Repository
+git clone https://github.com/yourusername/LinkedIn-Job-Automation-with-AI.git
 cd LinkedIn-Job-Automation-with-AI
-
-# Python virtual environment
+2ï¸âƒ£ Backend Setup
 python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # Linux/Mac
-
+.venv\Scripts\activate     # Windows
 pip install -r requirements.txt
 playwright install chromium
+3ï¸âƒ£ Environment Variables
 
-# Frontend
-cd frontend/lovable
-npm install
-cd ../..
-```
+Copy .env.example â†’ .env
 
-### 2. Configure Environment
+# LinkedIn
+LINKEDIN_EMAIL=
+LINKEDIN_PASSWORD=
 
-Copy `.env.example` to `.env` and fill in your values:
+# AI
+GITHUB_API_KEY=
+GROQ_API_KEY=
+OPENAI_API_KEY=
 
-```dotenv
-# -- LinkedIn ------------------------------------------
-LINKEDIN_EMAIL=your@email.com
-LINKEDIN_PASSWORD=your_password
+# Database
+DATABASE_URL=postgresql://user:pass@host:5432/dbname
 
-# -- AI Keys (at least one required for unknown fields) -
-GITHUB_API_KEY=ghp_xxxxxxxxxxxx        # GitHub Personal Access Token
-groq_api_key=gsk_xxxxxxxxxxxxxxxxxxxx  # https://console.groq.com
-OPENAI_API_KEY=sk-xxxxxxxxxxxx         # Optional fallback
+# Auth
+SECRET_KEY=your-32-char-secret
 
-# -- Database ------------------------------------------
-DATABASE_URL=postgresql://user:pass@localhost:5432/auto-agent-hire
-
-# -- Auth ----------------------------------------------
-SECRET_KEY=your-32-char-random-secret
-
-# -- Job Search Defaults -------------------------------
+# Defaults
 JOB_KEYWORDS=Software Engineer
 JOB_LOCATION=India
 MAX_APPLICATIONS=5
-TEST_MODE=true          # true = dry run (no submissions)
-```
+TEST_MODE=true
+4ï¸âƒ£ Run Backend
+uvicorn backend.main:app --reload --port 8000
 
-Create `frontend/lovable/.env.local`:
+Swagger:
 
-```dotenv
-VITE_API_URL=http://localhost:8000
-```
+http://localhost:8000/docs
+5ï¸âƒ£ Frontend
+cd frontend/lovable
+npm install
+npm run dev
 
-### 3. Initialize Database
+Open:
 
-```bash
-python scripts/setup_db.py
-```
+http://localhost:8080
+ðŸš€ Deployment
+Backend â†’ Render
 
-### 4. Start Servers
+Push repo to GitHub
 
-```bash
-# Terminal 1 — Backend API (http://localhost:8000)
-PYTHONPATH=. uvicorn backend.main:app --reload --port 8000
+Create new Web Service on Render
 
-# Windows PowerShell
-$env:PYTHONPATH="."; .venv\Scripts\python.exe -m uvicorn backend.main:app --reload --port 8000
+Connect repository
 
-# Terminal 2 — Frontend (http://localhost:8080)
-cd frontend/lovable && npm run dev
-```
+Add environment variables in Render dashboard:
 
-Open [http://localhost:8080](http://localhost:8080)
+DATABASE_URL
 
-Swagger docs at [http://localhost:8000/docs](http://localhost:8000/docs)
+SECRET_KEY
 
----
+LINKEDIN_EMAIL
 
-## Deployment
+LINKEDIN_PASSWORD
 
-### Backend ? Render
+AI keys
 
-1. Push repo to GitHub
-2. Go to [render.com](https://render.com) ? **New Web Service** ? connect your repo
-3. Render auto-reads `render.yaml` — click **Deploy**
-4. Set these **Secret** environment variables in the Render dashboard:
+CORS_ORIGINS
 
-| Variable | Description |
-|----------|-------------|
-| `DATABASE_URL` | PostgreSQL connection string |
-| `SECRET_KEY` | Random 32-char string for JWT |
-| `LINKEDIN_EMAIL` | LinkedIn account email |
-| `LINKEDIN_PASSWORD` | LinkedIn account password |
-| `GITHUB_API_KEY` | GitHub PAT (for AI field filling) |
-| `groq_api_key` | Groq API key |
-| `OPENAI_API_KEY` | OpenAI key (optional fallback) |
-| `CORS_ORIGINS` | Your Vercel URL e.g. `https://yourapp.vercel.app` |
+Backend URL:
 
-Your backend URL will be: `https://linkedin-automation-backend.onrender.com`
+https://your-backend.onrender.com
+Frontend â†’ Vercel
 
-> `render.yaml` runs `build.sh` which installs `requirements.txt` and `playwright install chromium` automatically.
+Import project in Vercel
 
----
+Set root directory: frontend/lovable
 
-### Frontend ? Vercel
+Add:
 
-1. Go to [vercel.com](https://vercel.com) ? **New Project** ? import your GitHub repo
-2. Set **Root Directory** to `frontend/lovable`
-3. Add environment variable in Vercel dashboard:
+VITE_API_URL=https://your-backend.onrender.com
 
-| Variable | Value |
-|----------|-------|
-| `VITE_API_URL` | Your Render backend URL |
+Deploy.
 
-4. Click **Deploy**
+ðŸ” Security Notes
 
-> Vercel hosts the static React build only. The Python backend runs entirely on Render.
+All secrets stored in environment variables
 
----
+.env never committed
 
-### Docker (Self-Hosted)
+JWT expiration enabled
 
-```bash
-# Build and run everything with Docker Compose
-cd docker
-docker-compose up --build
-```
+Passwords hashed with bcrypt
 
-Services start on:
-- Frontend: `http://localhost:8080`
-- Backend: `http://localhost:8000`
+No hardcoded credentials
 
----
+Browser runs isolated subprocess
 
-## API Reference
+âš  Limitations
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/health` | Health check |
-| `POST` | `/auth/signup` | Register new user |
-| `POST` | `/auth/login` | Login ? JWT token |
-| `POST` | `/api/v2/start-automation` | Start LinkedIn automation |
-| `GET` | `/api/v2/automation-status/{id}` | Poll live progress |
-| `GET` | `/api/v2/automation-results/{id}` | Fetch final results |
-| `POST` | `/api/v1/resume/upload` | Upload resume (PDF/DOCX) |
-| `POST` | `/api/run-agent` | Run AI agent pipeline |
-| `GET` | `/docs` | Interactive Swagger UI |
+LinkedIn UI changes may break selectors
 
----
+CAPTCHA may require manual solve
 
-## Troubleshooting
+High-volume automation may trigger security checks
 
-| Symptom | Solution |
-|---------|----------|
-| `playwright install` fails on Render | `build.sh` handles this automatically via `render.yaml` |
-| CORS error in browser | Set `CORS_ORIGINS=https://yourapp.vercel.app` in Render env vars |
-| Database connection refused | Verify `DATABASE_URL` in Render/local `.env` |
-| "Save this application?" popup appears | Fixed in v3 — bot auto-dismisses it without using Escape key |
-| Unknown form fields left empty | AI fallback active — set `GITHUB_API_KEY` or `groq_api_key` in `.env` |
-| Bot keeps re-filling same field | Fixed in v3 — `FieldTracker` prevents any field being processed twice |
-| LinkedIn security checkpoint | Run once manually with `headless=false` to complete the challenge |
-| `psycopg2` not found | `psycopg2-binary` is in `requirements.txt`; Render installs it automatically |
+Intended for educational/demo use
 
----
+ðŸ“Š API Endpoints
+Method	Endpoint	Description
+GET	/health	Health check
+POST	/auth/signup	Register
+POST	/auth/login	Login
+POST	/api/v2/start-automation	Start bot
+GET	/api/v2/automation-status/{id}	Poll status
+GET	/api/v2/automation-results/{id}	Get results
+POST	/api/v1/resume/upload	Upload resume
+ðŸ§ª Troubleshooting
+Issue	Solution
+DB connection error	Verify DATABASE_URL
+CORS error	Set CORS_ORIGINS correctly
+AI not answering fields	Ensure AI key configured
+Automation stuck	Run once with headless=false
+Playwright not installed	Run playwright install chromium
+ðŸ“ˆ Why This Project Is Powerful
 
-## License
+This project demonstrates:
 
-MIT — see [LICENSE](LICENSE).
+Full-stack engineering
 
+AI integration
 
+Automation engineering
+
+Browser control
+
+JWT auth
+
+Database design
+
+Subprocess management
+
+Production deployment
+
+This is not a basic student project â€” it is a real-world AI automation system.
+
+ðŸ“œ License
+
+MIT License

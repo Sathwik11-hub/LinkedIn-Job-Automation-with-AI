@@ -50,7 +50,7 @@ try:
         find_matching_jobs
     )
 except Exception as _vs_err:
-    print(f"⚠️ Vector store unavailable: {_vs_err}")
+    print("[DB] WARNING - Vector store unavailable: " + str(_vs_err).splitlines()[0])
     VectorStoreManager = None
     vector_store = None
     get_embedding = None
@@ -65,6 +65,14 @@ from backend.database.file_storage import (
     save_screenshot,
     get_file
 )
+
+# Qdrant Cloud Vector Store
+try:
+    from backend.database.qdrant_store import QdrantVectorStore, qdrant_store
+except Exception as _qd_err:
+    print("[QD] WARNING - Qdrant store unavailable: " + str(_qd_err).splitlines()[0])
+    QdrantVectorStore = None
+    qdrant_store = None
 
 __all__ = [
     # Connection
@@ -111,4 +119,8 @@ __all__ = [
     'save_resume',
     'save_screenshot',
     'get_file',
+
+    # Qdrant Cloud Vector Store
+    'QdrantVectorStore',
+    'qdrant_store',
 ]

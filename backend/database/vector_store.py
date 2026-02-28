@@ -22,14 +22,14 @@ try:
     faiss = _faiss
     FAISS_AVAILABLE = True
 except ImportError:
-    print("⚠️ FAISS not installed. Using fallback similarity search.")
+    print("[VS] WARNING - FAISS not installed. Using fallback similarity search.")
 
 try:
     from sentence_transformers import SentenceTransformer as _SentenceTransformer
     SentenceTransformer = _SentenceTransformer
     SENTENCE_TRANSFORMERS_AVAILABLE = True
 except Exception:
-    print("⚠️ sentence-transformers/torch not available on this Python version. Using fallback embedding.")
+    print("[VS] WARNING - sentence-transformers/torch not available. Using fallback embedding.")
 
 
 class VectorStoreManager:
@@ -71,21 +71,21 @@ class VectorStoreManager:
         if self.resume_index_path.exists():
             self.resume_index = faiss.read_index(str(self.resume_index_path))
             self.resume_mapping = self._load_mapping(self.resume_mapping_path)
-            print(f"✅ Loaded resume index with {self.resume_index.ntotal} vectors")
+            print("[VS] Loaded resume index with " + str(self.resume_index.ntotal) + " vectors")
         else:
             self.resume_index = faiss.IndexFlatIP(self.dimension)  # Inner product for cosine similarity
             self.resume_mapping = {}
-            print("✅ Created new resume index")
+            print("[VS] Created new resume index")
         
         # Job index
         if self.job_index_path.exists():
             self.job_index = faiss.read_index(str(self.job_index_path))
             self.job_mapping = self._load_mapping(self.job_mapping_path)
-            print(f"✅ Loaded job index with {self.job_index.ntotal} vectors")
+            print("[VS] Loaded job index with " + str(self.job_index.ntotal) + " vectors")
         else:
             self.job_index = faiss.IndexFlatIP(self.dimension)
             self.job_mapping = {}
-            print("✅ Created new job index")
+            print("[VS] Created new job index")
     
     def _ensure_model_loaded(self):
         """Lazy load the embedding model when first needed"""
@@ -93,9 +93,9 @@ class VectorStoreManager:
             try:
                 self.embedding_model = SentenceTransformer(self.embedding_model_name)
                 self._model_loaded = True
-                print(f"✅ Loaded embedding model: {self.embedding_model_name}")
+                print("[VS] Loaded embedding model: " + self.embedding_model_name)
             except Exception as e:
-                print(f"⚠️ Could not load embedding model: {e}")
+                print("[VS] WARNING - Could not load embedding model: " + str(e).splitlines()[0])
                 self._model_loaded = True  # Mark as attempted to avoid repeated failures
     
     def _load_mapping(self, path: Path) -> Dict:
@@ -123,7 +123,7 @@ class VectorStoreManager:
                 embedding = self.embedding_model.encode(text, convert_to_numpy=True)
                 return embedding.astype('float32')
             except Exception as e:
-                print(f"⚠️ Embedding generation error: {e}")
+                print("[VS] ERROR - Embedding generation: " + str(e).splitlines()[0])
                 return None
         else:
             # Fallback: simple TF-IDF style vector (not recommended for production)
@@ -165,7 +165,7 @@ class VectorStoreManager:
             faiss.write_index(self.resume_index, str(self.resume_index_path))
             self._save_mapping(self.resume_mapping, self.resume_mapping_path)
             
-            print(f"✅ Added resume {resume_id} to vector index (idx={idx})")
+            print("[VS] Added resume " + str(resume_id) + " to vector index (idx=" + str(idx) + ")")
         
         return embedding.flatten().tolist()
     
@@ -192,7 +192,7 @@ class VectorStoreManager:
             faiss.write_index(self.job_index, str(self.job_index_path))
             self._save_mapping(self.job_mapping, self.job_mapping_path)
             
-            print(f"✅ Added job {job_id} to vector index (idx={idx})")
+            print("[VS] Added job " + str(job_id) + " to vector index (idx=" + str(idx) + ")")
         
         return embedding.flatten().tolist()
     
@@ -339,12 +339,12 @@ class VectorStoreManager:
         """Remove a resume from the index (requires rebuilding)"""
         # FAISS doesn't support direct deletion, need to rebuild index
         # For production, consider using IVF index with IDSelector
-        print(f"⚠️ Resume {resume_id} marked for removal (rebuild required)")
+        print("[VS] Resume " + str(resume_id) + " marked for removal (rebuild required)")
         return True
     
     def remove_job(self, job_id: str) -> bool:
         """Remove a job from the index (requires rebuilding)"""
-        print(f"⚠️ Job {job_id} marked for removal (rebuild required)")
+        print("[VS] Job " + str(job_id) + " marked for removal (rebuild required)")
         return True
     
     def rebuild_indexes(self):

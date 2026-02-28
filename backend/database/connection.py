@@ -1,6 +1,6 @@
 """
 Database Connection Manager for AutoAgentHire
-Supports both PostgreSQL and SQLite
+Supports PostgreSQL (Supabase) and SQLite with automatic fallback.
 """
 
 import os
@@ -8,9 +8,9 @@ import sys
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Generator, Optional
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import StaticPool, NullPool
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -21,52 +21,94 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 # Import models
 from backend.database.models_complete import Base
 
-# Database URL Configuration
-DATABASE_URL = os.getenv(
-    'DATABASE_URL',
-    'sqlite:///./data/autoagenthire.db'  # Default to SQLite for development
-)
+_SQLITE_FALLBACK = 'sqlite:///./data/autoagenthire.db'
+_echo = os.getenv('DEBUG', 'False').lower() == 'true'
 
-# For SQLite, use check_same_thread=False
-if DATABASE_URL.startswith('sqlite'):
-    engine = create_engine(
-        DATABASE_URL,
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-        echo=os.getenv('DEBUG', 'False').lower() == 'true'
-    )
-else:
-    # PostgreSQL configuration
-    engine = create_engine(
-        DATABASE_URL,
+
+def _make_engine(url: str):
+    """Create a SQLAlchemy engine for the given URL."""
+    if url.startswith('sqlite'):
+        return create_engine(
+            url,
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+            echo=_echo,
+        )
+    # Strip asyncpg prefix — we always use psycopg2 for sync connections
+    sync_url = url.replace('postgresql+asyncpg://', 'postgresql://', 1)
+    if 'supabase' in sync_url or any(c in sync_url for c in ['.supabase.co', '.pooler.supabase.com']):
+        return create_engine(
+            sync_url,
+            poolclass=NullPool,
+            pool_pre_ping=True,
+            echo=_echo,
+            connect_args={"connect_timeout": 10},
+        )
+    # Generic PostgreSQL (local / Docker)
+    return create_engine(
+        sync_url,
         pool_size=10,
         max_overflow=20,
         pool_pre_ping=True,
-        echo=os.getenv('DEBUG', 'False').lower() == 'true'
+        echo=_echo,
     )
+
+
+def _resolve_engine():
+    """
+    Try each DATABASE_URL candidate in order and return the first engine
+    that can actually reach the server.
+
+    Priority:
+      1. SYNC_DATABASE_URL  (explicit sync override)
+      2. DATABASE_URL       (primary setting)
+      3. SQLite fallback    (local development safety net)
+    """
+    candidates = []
+    for key in ('SYNC_DATABASE_URL', 'DATABASE_URL'):
+        val = os.getenv(key, '').strip()
+        if val and val not in candidates:
+            candidates.append(val)
+    candidates.append(_SQLITE_FALLBACK)  # always have a last resort
+
+    for url in candidates:
+        try:
+            eng = _make_engine(url)
+            # Quick liveness check (1 s timeout for remote, instant for SQLite)
+            with eng.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            display = url.split('@')[-1] if '@' in url else url
+            print("[DB] Connected: " + display)
+            return eng, url
+        except Exception as exc:
+            display = url.split('@')[-1] if '@' in url else url
+            print("[DB] WARNING - Could not connect to " + display + ": " + str(exc).splitlines()[0])
+
+    raise RuntimeError("No database backend is reachable. Check your .env and network.")
+
+
+# Build the engine once at import time
+engine, DATABASE_URL = _resolve_engine()
 
 # Session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def init_db():
-    """Initialize database tables"""
+    """Initialize database tables — creates all tables if they don't exist."""
     try:
-        # Ensure data directory exists
-        db_path = Path('./data')
-        db_path.mkdir(parents=True, exist_ok=True)
-        
+        Path('./data').mkdir(parents=True, exist_ok=True)
         Base.metadata.create_all(bind=engine)
-        print("✅ Database tables created successfully")
+        print("[DB] Tables created/verified successfully")
     except Exception as e:
-        print(f"⚠️ Database initialization error: {e}")
+        print("[DB] WARNING - Table initialization error: " + str(e))
         print("Continuing without database initialization...")
 
 
 def drop_db():
     """Drop all database tables (use with caution!)"""
     Base.metadata.drop_all(bind=engine)
-    print("⚠️ All database tables dropped")
+    print("[DB] All database tables dropped")
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -115,12 +157,11 @@ class DatabaseManager:
     def health_check(self) -> bool:
         """Check database connectivity"""
         try:
-            from sqlalchemy import text
-            with self.create_session() as session:
-                session.execute(text("SELECT 1"))
+            with self.engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
             return True
         except Exception as e:
-            print(f"❌ Database health check failed: {e}")
+            print("[DB] Health check failed: " + str(e))
             return False
 
 
