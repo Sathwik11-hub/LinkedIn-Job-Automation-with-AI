@@ -9,8 +9,14 @@ from backend.llm.gemini_service import GeminiService
 
 router = APIRouter(prefix="/api/cover-letter", tags=["Cover Letter"])
 
-# Initialize Gemini service
-gemini_service = GeminiService()
+# Instantiated on first request, not at import time
+_gemini_service = None
+
+def _get_gemini():
+    global _gemini_service
+    if _gemini_service is None:
+        _gemini_service = GeminiService()
+    return _gemini_service
 
 
 class CoverLetterRequest(BaseModel):
@@ -27,7 +33,7 @@ async def generate_cover_letter_endpoint(request: CoverLetterRequest):
     
     try:
         # Use Gemini's generate_cover_letter method with proper parameters
-        cover_letter = gemini_service.generate_cover_letter(
+        cover_letter = _get_gemini().generate_cover_letter(
             job_title="Position from Job Description",  # Extract from JD if needed
             company="Company Name",  # Extract from JD if needed
             job_description=request.job_description,

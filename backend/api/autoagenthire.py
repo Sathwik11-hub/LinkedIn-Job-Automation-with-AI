@@ -9,7 +9,15 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 
-from backend.agents.autoagenthire_bot import AutoAgentHireBot
+# Lazy-load to avoid slow startup (autoagenthire_bot imports torch/playwright at module level)
+_AutoAgentHireBot = None
+
+def _get_bot():
+    global _AutoAgentHireBot
+    if _AutoAgentHireBot is None:
+        from backend.agents.autoagenthire_bot import AutoAgentHireBot
+        _AutoAgentHireBot = AutoAgentHireBot
+    return _AutoAgentHireBot
 
 router = APIRouter(prefix="/api", tags=["AutoAgentHire"])
 
@@ -138,9 +146,9 @@ async def search_linkedin_jobs(request: JobSearchRequest):
             'linkedin_password': linkedin_password,
         }
         
-        print(f"\n🔍 Searching LinkedIn for: {config['keyword']} in {config['location']}")
+        print(f"\n Searching LinkedIn for: {config['keyword']} in {config['location']}")
         
-        bot = AutoAgentHireBot(config)
+        bot = _get_bot()(config)
         
         # Only search, don't apply
         jobs = await bot.search_jobs_only()
@@ -252,7 +260,7 @@ async def apply_single_job(request: ApplySingleRequest):
             'user_profile': request.user_profile or {},
         }
 
-        bot = AutoAgentHireBot(config)
+        bot = _get_bot()(config)
         try:
             result = await bot.apply_to_single_job(request.job_url)
         finally:
@@ -278,7 +286,7 @@ async def apply_single_job(request: ApplySingleRequest):
 async def run_automation_task(run_id: str, config: dict):
     """Background task to run automation"""
     try:
-        bot = AutoAgentHireBot(config)
+        bot = _get_bot()(config)
         result = await bot.run_automation()
         
         active_tasks[run_id] = {
