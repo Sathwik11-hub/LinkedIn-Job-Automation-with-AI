@@ -815,6 +815,15 @@ class LinkedInAutoApply:
                 return result
 
             # Fill the whole form using IntelligentFormFiller
+            # Parse skill_experience from env var format: "Python:4,FastAPI:3,SQL:5"
+            skill_exp_raw = os.getenv('SKILL_EXPERIENCE', '')
+            skill_experience = {}
+            if skill_exp_raw:
+                for pair in skill_exp_raw.split(','):
+                    if ':' in pair:
+                        skill, years = pair.split(':', 1)
+                        skill_experience[skill.strip()] = years.strip()
+
             user_profile = {
                 'email': self.email,
                 'first_name': os.getenv('FIRST_NAME', ''),
@@ -825,34 +834,72 @@ class LinkedInAutoApply:
                 'github_url': os.getenv('GITHUB_URL', ''),
                 'website': os.getenv('PORTFOLIO_URL', ''),
                 'requires_sponsorship': os.getenv('REQUIRES_SPONSORSHIP', 'No'),
+                'years_experience': os.getenv('YEARS_EXPERIENCE', '3'),
+                'notice_period_days': os.getenv('NOTICE_PERIOD_DAYS', '0'),
+                'expected_salary': os.getenv('EXPECTED_SALARY', ''),
+                'current_ctc': os.getenv('CURRENT_CTC', os.getenv('EXPECTED_SALARY', '0')),
+                'cgpa': os.getenv('CGPA', '8.0'),
+                'internship_months': os.getenv('INTERNSHIP_MONTHS', '6'),
+                'drivers_license': os.getenv('DRIVERS_LICENSE', 'Yes'),
+                'gender': os.getenv('GENDER', 'Male'),
+                'skill_experience': skill_experience,
             }
             form_filler = IntelligentFormFiller(self.page, user_profile=user_profile, resume_text=self.resume_text)
             await form_filler.fill_application_form()
 
             # Advance through Easy Apply stages (Next/Review/Submit)
-            await self._complete_easy_apply_flow()
-            
-            # NOTE: cover letter generation can be inserted into the flow if a field exists.
-            # Many LinkedIn Easy Apply flows do not include a cover letter textarea.
+            await self._complete_easy_apply_flow(user_profile)
             
             result.status = 'success'
-            logger.info(f"✅ Successfully applied to {job.title}")
+            logger.info(f"[APPLY] Successfully applied to {job.title}")
         
         except Exception as e:
-            logger.error(f"❌ Error applying to {job.title}: {e}")
+            logger.error(f"[APPLY] Error applying to {job.title}: {e}")
             result.status = 'failed'
             result.error_message = str(e)
         
         return result
 
-    async def _complete_easy_apply_flow(self, max_steps: int = 12):
-        """Complete the Easy Apply modal by clicking Next/Review/Submit as they appear."""
+    def _build_user_profile(self) -> Dict:
+        """Build user_profile dict from env vars (called once per job)."""
+        skill_exp_raw = os.getenv('SKILL_EXPERIENCE', '')
+        skill_experience = {}
+        if skill_exp_raw:
+            for pair in skill_exp_raw.split(','):
+                if ':' in pair:
+                    skill, years = pair.split(':', 1)
+                    skill_experience[skill.strip()] = years.strip()
+        return {
+            'email': self.email,
+            'first_name': os.getenv('FIRST_NAME', ''),
+            'last_name': os.getenv('LAST_NAME', ''),
+            'phone_number': os.getenv('PHONE_NUMBER', ''),
+            'city': os.getenv('CITY', ''),
+            'linkedin_url': os.getenv('LINKEDIN_URL', ''),
+            'github_url': os.getenv('GITHUB_URL', ''),
+            'website': os.getenv('PORTFOLIO_URL', ''),
+            'requires_sponsorship': os.getenv('REQUIRES_SPONSORSHIP', 'No'),
+            'years_experience': os.getenv('YEARS_EXPERIENCE', '3'),
+            'notice_period_days': os.getenv('NOTICE_PERIOD_DAYS', '0'),
+            'expected_salary': os.getenv('EXPECTED_SALARY', '600000'),
+            'current_ctc': os.getenv('CURRENT_CTC', os.getenv('EXPECTED_SALARY', '0')),
+            'cgpa': os.getenv('CGPA', '8.0'),
+            'internship_months': os.getenv('INTERNSHIP_MONTHS', '6'),
+            'drivers_license': os.getenv('DRIVERS_LICENSE', 'Yes'),
+            'gender': os.getenv('GENDER', 'Male'),
+            'skill_experience': skill_experience,
+        }
+
+    async def _complete_easy_apply_flow(self, user_profile: Dict = None, max_steps: int = 12):
+        """Complete the Easy Apply modal: fill → validate → click Next → detect errors → retry once."""
         if not self.page:
             raise Exception("Browser not initialized")
 
+        if user_profile is None:
+            user_profile = self._build_user_profile()
+
         page = self.page
 
-        # Common button labels / aria-labels seen in Easy Apply
         next_selectors = [
             'button[aria-label*="Continue" i]',
             'button[aria-label*="Next" i]',
@@ -874,52 +921,74 @@ class LinkedInAutoApply:
             for sel in selectors:
                 try:
                     el = await page.query_selector(sel)
-                    if not el:
-                        continue
-                    if not await el.is_visible():
-                        continue
-                    if not await el.is_enabled():
-                        continue
-                    return el
+                    if el and await el.is_visible() and await el.is_enabled():
+                        return el
                 except Exception:
                     continue
             return None
 
-        for _ in range(max_steps):
-            # If a security challenge appears, stop.
-            url_lower = (self.page.url or '').lower()
+        def _make_filler():
+            return IntelligentFormFiller(page, user_profile=user_profile,
+                                        resume_text=self.resume_text)
+
+        for step in range(max_steps):
+            # Security challenge guard
+            url_lower = (page.url or '').lower()
             if 'checkpoint/challenge' in url_lower or 'captcha' in url_lower:
                 raise Exception("Security challenge detected; cannot proceed automatically")
 
-            # Try submit first (end condition)
+            # ---- SUBMIT (end condition) ----
             submit_btn = await _first_clickable(submit_selectors)
             if submit_btn:
-                logger.info("✉️ Submitting application...")
+                filler = _make_filler()
+                await filler.validate_and_fix()
+                logger.info("[APPLY] Submitting application...")
                 await submit_btn.click()
                 await self.human_delay(2, 4)
-                logger.info("✅ Application submitted")
+                logger.info("[APPLY] Application submitted")
                 return
 
-            # Then review/preview
+            # ---- REVIEW ----
             review_btn = await _first_clickable(review_selectors)
             if review_btn:
-                logger.info("➡️ Clicking Review/Preview...")
+                filler = _make_filler()
+                await filler.validate_and_fix()
+                logger.info("[APPLY] Clicking Review...")
                 await review_btn.click()
                 await self.human_delay(1.5, 3)
-                # Fill any newly revealed fields after review step
-                await IntelligentFormFiller(self.page, user_profile={'email': self.email}, resume_text=self.resume_text).fill_application_form()
+                filler2 = _make_filler()
+                await filler2.fill_application_form()
                 continue
 
-            # Then next/continue
+            # ---- NEXT / CONTINUE ----
             next_btn = await _first_clickable(next_selectors)
             if next_btn:
-                logger.info("➡️ Clicking Next/Continue...")
+                # PART 3 — validate BEFORE clicking Next
+                filler = _make_filler()
+                await filler.validate_and_fix()
+
+                logger.info("[APPLY] Clicking Next...")
                 await next_btn.click()
                 await self.human_delay(1.5, 3)
-                await IntelligentFormFiller(self.page, user_profile={'email': self.email}, resume_text=self.resume_text).fill_application_form()
+
+                # PART 4 — detect errors AFTER clicking Next; retry once
+                filler_post = _make_filler()
+                if await filler_post.has_visible_errors():
+                    logger.info("[APPLY] Errors detected after Next — re-filling & retrying...")
+                    await filler_post.fill_application_form()
+                    await filler_post.validate_and_fix()
+                    await self.human_delay(0.5, 1)
+                    # Re-click Next
+                    next_btn2 = await _first_clickable(next_selectors)
+                    if next_btn2:
+                        await next_btn2.click()
+                        await self.human_delay(1.5, 3)
+                else:
+                    # No errors — fill new page fields
+                    await filler_post.fill_application_form()
                 continue
 
-            # If we can't find any progression button, we stop with a clear error
+            # No progression button found
             raise Exception("Could not find Next/Review/Submit button in Easy Apply modal")
     
     async def _fill_application_form(self, job: JobListing):

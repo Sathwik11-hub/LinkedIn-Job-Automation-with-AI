@@ -156,22 +156,29 @@ class Settings(BaseSettings):
 try:
     settings = Settings()  # type: ignore[call-arg]
 except Exception as e:
-    # If environment parsing/validation fails (common during local dev),
-    # fall back to a minimal, safe Settings object constructed from
-    # environment variables or sensible defaults so the app can start.
+    # If environment parsing/validation fails, build a minimal Settings object.
+    # This handles cases where optional fields are missing but the app can still run.
     import os
     print("Warning: Settings validation failed, falling back to minimal defaults:", e)
-    settings = Settings.model_construct(  # Use model_construct instead of construct
+
+    _secret_key = os.environ.get("SECRET_KEY", "")
+    if not _secret_key:
+        raise RuntimeError(
+            "SECRET_KEY environment variable is required and must not be empty. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+        ) from e
+
+    settings = Settings.model_construct(  # type: ignore[call-arg]
         APP_NAME=os.environ.get("APP_NAME", "AutoAgentHire"),
         APP_ENV=os.environ.get("APP_ENV", "development"),
         DEBUG=os.environ.get("DEBUG", "True") in ["True", "true", "1"],
         LOG_LEVEL=os.environ.get("LOG_LEVEL", "INFO"),
         API_HOST=os.environ.get("API_HOST", "0.0.0.0"),
-        API_PORT=int(os.environ.get("API_PORT", 8000)),
+        API_PORT=int(os.environ.get("API_PORT", "8000")),
         API_RELOAD=False,
-        SECRET_KEY=os.environ.get("SECRET_KEY", "dev-secret"),
-        DATABASE_URL=os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./autoagenthire.db"),
-        OPENAI_API_KEY=os.environ.get("OPENAI_API_KEY", "test-key"),
+        SECRET_KEY=_secret_key,
+        DATABASE_URL=os.environ.get("DATABASE_URL", "sqlite:///./data/autoagenthire.db"),
+        OPENAI_API_KEY=os.environ.get("OPENAI_API_KEY", ""),
         CORS_ORIGINS=os.environ.get("CORS_ORIGINS", "http://localhost:3000,http://localhost:8501"),
         ALLOWED_RESUME_EXTENSIONS=os.environ.get("ALLOWED_RESUME_EXTENSIONS", "pdf,docx,txt"),
     )

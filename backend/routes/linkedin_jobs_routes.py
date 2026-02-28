@@ -61,9 +61,9 @@ async def get_recommended_jobs(payload: RecommendedJobsRequest):
     }
     """
     try:
-        print("📨 Received request for recommended jobs")
-        print(f"   Role filter: {payload.job_role}")
-        print(f"   Filtering enabled: {payload.enable_filtering}")
+        print("[JOBS] Received request for recommended jobs")
+        print(f"[JOBS]   Role filter: {payload.job_role}")
+        print(f"[JOBS]   Filtering enabled: {payload.enable_filtering}")
         
         # Fetch raw jobs from LinkedIn
         raw_jobs = await fetch_recommended_jobs(
@@ -71,7 +71,7 @@ async def get_recommended_jobs(payload: RecommendedJobsRequest):
             password=payload.linkedin_password,
         )
         
-        print(f"✅ Fetched {len(raw_jobs)} raw jobs from LinkedIn")
+        print(f"[JOBS] Fetched {len(raw_jobs)} raw jobs from LinkedIn")
         
         # ===================================================================
         # PRODUCTION FILTERING PIPELINE
@@ -102,14 +102,14 @@ async def get_recommended_jobs(payload: RecommendedJobsRequest):
         
         # Apply production-grade filtering if enabled
         if payload.enable_filtering and payload.job_role:
-            print(f"🔍 Applying PRODUCTION filtering for role: {payload.job_role}")
+            print(f"[JOBS] Applying PRODUCTION filtering for role: {payload.job_role}")
             
             # Convert role to role_key format
             role_key = payload.job_role.lower().replace(" ", "_")
             
             # Validate role exists
             if role_key not in ROLE_TAXONOMY:
-                print(f"⚠️  Unknown role '{role_key}', returning all jobs")
+                print(f"[JOBS] WARNING - Unknown role '{role_key}', returning all jobs")
                 filtered_jobs = jobs_for_filtering
                 filter_warning = f"Role '{payload.job_role}' not recognized. Showing all jobs."
             else:
@@ -121,15 +121,13 @@ async def get_recommended_jobs(payload: RecommendedJobsRequest):
                     return_reasons=True
                 )
                 
-                print(f"✅ Production filter: {len(filtered_jobs)}/{len(jobs_for_filtering)} jobs passed")
+                print(f"[JOBS] Production filter: {len(filtered_jobs)}/{len(jobs_for_filtering)} jobs passed")
                 
                 # If filtering is TOO strict (removes everything), provide helpful warning
                 if len(filtered_jobs) == 0:
-                    print(f"⚠️  ZERO jobs passed production filters!")
-                    print(f"   This means NO jobs matched {role_key} criteria (title + skills + not excluded)")
-                    print(f"   Recommendation: Either:")
-                    print(f"   1. Disable strict filtering (show all LinkedIn recommendations)")
-                    print(f"   2. LinkedIn's recommendations don't match your selected role")
+                    print(f"[JOBS] WARNING - ZERO jobs passed production filters")
+                    print(f"[JOBS] No jobs matched {role_key} criteria (title + skills + not excluded)")
+                    print(f"[JOBS] Recommendation: disable filtering or widen role criteria")
                     
                     # Return empty with clear message
                     filter_warning = f"No jobs matched strict '{payload.job_role}' criteria. LinkedIn recommended jobs like '{raw_jobs[0].get('title', 'N/A') if raw_jobs else 'N/A'}' which don't contain required keywords. Try disabling filtering to see all recommendations."
@@ -138,7 +136,7 @@ async def get_recommended_jobs(payload: RecommendedJobsRequest):
         else:
             filtered_jobs = jobs_for_filtering
             filter_warning = None
-            print(f"⏭️  Filtering disabled, returning all {len(filtered_jobs)} jobs")
+            print(f"[JOBS] Filtering disabled, returning all {len(filtered_jobs)} jobs")
         
         # Transform back to API format
         result_jobs = []
@@ -172,7 +170,7 @@ async def get_recommended_jobs(payload: RecommendedJobsRequest):
         
     except Exception as e:
         msg = str(e)
-        print(f"❌ Error in recommended jobs endpoint: {msg}")
+        print(f"[JOBS] ERROR in recommended jobs endpoint: {msg}")
 
         # Common, expected user-facing failures should not crash the UI with 500s.
         if "Login failed" in msg or "Login not confirmed" in msg or "checkpoint" in msg.lower() or "authwall" in msg.lower():

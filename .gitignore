@@ -24,6 +24,7 @@ share/python-wheels/
 MANIFEST
 
 # Virtual Environment
+.venv/
 venv/
 env/
 ENV/
@@ -110,6 +111,7 @@ screenshots/
 *.jpg
 !docs/*.png
 browser_profile/
+frontend/lovable/browser_profile/
 
 # Jupyter Notebooks
 .ipynb_checkpoints
