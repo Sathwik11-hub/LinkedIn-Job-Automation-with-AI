@@ -2,9 +2,14 @@
 Configuration management using Pydantic Settings.
 Loads environment variables and provides type-safe configuration.
 """
+import os
+from pathlib import Path
 from typing import List, Optional
 from pydantic import Field, validator
 from pydantic_settings import BaseSettings
+
+# Resolve .env from project root (one level up from this file's directory)
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
 class Settings(BaseSettings):
@@ -28,7 +33,7 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     
     # Database
-    DATABASE_URL: str
+    DATABASE_URL: str = "sqlite:///./data/autoagenthire.db"  # SQLite fallback if not set
     SYNC_DATABASE_URL: Optional[str] = None
     
     # Redis
@@ -45,7 +50,7 @@ class Settings(BaseSettings):
     PINECONE_INDEX_NAME: Optional[str] = None
     
     # OpenAI
-    OPENAI_API_KEY: str
+    OPENAI_API_KEY: Optional[str] = None   # Optional — app falls back to Gemini/Groq
     OPENAI_MODEL: str = "gpt-4-turbo-preview"
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
     OPENAI_MAX_TOKENS: int = 4000
@@ -138,6 +143,14 @@ class Settings(BaseSettings):
     LINKEDIN_EMAIL: Optional[str] = None
     LINKEDIN_PASSWORD: Optional[str] = None
     GEMINI_API_KEY: Optional[str] = None
+    GROQ_API_KEY: Optional[str] = None
+    GITHUB_API_KEY: Optional[str] = None
+    QDRANT_URL: Optional[str] = None
+    QDRANT_API_KEY: Optional[str] = None
+    SUPABASE_URL: Optional[str] = None
+    SUPABASE_KEY: Optional[str] = None
+    PLAYWRIGHT_BROWSERS_PATH: Optional[str] = None
+    DISABLE_LOCAL_VECTOR_STORE: bool = False
     
     # Logging
     LOG_FILE_PATH: str = "data/logs/app.log"
@@ -145,7 +158,7 @@ class Settings(BaseSettings):
     LOG_RETENTION: str = "30 days"
     
     class Config:
-        env_file = ".env"
+        env_file = str(_ENV_FILE)
         env_file_encoding = "utf-8"
         case_sensitive = True
         # Ignore extra environment variables that are not declared on the model
@@ -158,7 +171,6 @@ try:
 except Exception as e:
     # If environment parsing/validation fails, build a minimal Settings object.
     # This handles cases where optional fields are missing but the app can still run.
-    import os
     print("Warning: Settings validation failed, falling back to minimal defaults:", e)
 
     _secret_key = os.environ.get("SECRET_KEY", "")

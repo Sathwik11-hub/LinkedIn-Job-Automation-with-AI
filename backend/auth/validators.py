@@ -53,3 +53,29 @@ def validate_password_strength(password: str) -> Optional[str]:
     if not re.search(r"[!@#$%^&*()_+\-=\[\]{};':\"\\|,.<>\/?`~]", password):
         return "Password must contain at least one special character."
     return None
+
+
+# Pre-compiled regex for international phone numbers (E.164 compatible and common formats).
+_PHONE_RE = re.compile(
+    r"^\+?1?\s*[\-.]?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}$"
+    r"|^\+[1-9]\d{6,14}$"
+)
+
+
+def validate_phone_number(phone: str) -> Optional[str]:
+    """Validate phone number format.
+
+    Accepts common US formats and international E.164 format.
+
+    Returns:
+        ``None`` if valid, or an error message string if invalid.
+    """
+    if not phone or not phone.strip():
+        return "Phone number is required."
+    # Strip all spaces to do a digit count check
+    digits_only = re.sub(r"\D", "", phone.strip())
+    if len(digits_only) < 7 or len(digits_only) > 15:
+        return "Phone number must be between 7 and 15 digits."
+    if not _PHONE_RE.match(phone.strip()):
+        return "Invalid phone number format."
+    return None

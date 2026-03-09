@@ -149,3 +149,5 @@ dmypy.json
 
 # PyCharm
 .idea/
+# Fly.io — secrets script contains credentials after editing, never commit
+fly-secrets.sh

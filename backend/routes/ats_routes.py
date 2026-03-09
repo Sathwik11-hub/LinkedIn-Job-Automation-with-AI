@@ -10,9 +10,9 @@ from typing import List, Dict, Any
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 import docx
 from pypdf import PdfReader
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
+
+# Lazy imports — do NOT load sklearn/numpy at module level (causes OOM on low-memory servers)
+# They are imported inside the endpoint function that actually needs them.
 
 router = APIRouter(prefix="/api/ats", tags=["ATS"])
 
@@ -196,6 +196,9 @@ def calculate_ats_score(resume_text: str, job_description: str) -> Dict[str, Any
     
     # Calculate semantic similarity using TF-IDF
     try:
+        # Lazy import — only loads sklearn when this endpoint is actually called
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
         vectorizer = TfidfVectorizer(stop_words='english')
         tfidf_matrix = vectorizer.fit_transform([resume_text, job_description])
         # Calculate cosine similarity and convert result to float

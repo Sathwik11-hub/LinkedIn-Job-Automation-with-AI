@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from backend.auth.password import hash_password, verify_password
 from backend.auth.jwt import create_access_token
-from backend.auth.validators import validate_email_format, validate_password_strength
+from backend.auth.validators import validate_email_format, validate_password_strength, validate_phone_number
 from backend.auth.dependencies import get_current_user
 from backend.database.connection import get_db
 from backend.database.crud import UserRepository
@@ -37,6 +37,8 @@ class SignupRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=1)
     full_name: str | None = None
+    phone: str | None = None
+    location: str | None = None
 
 
 class SignupResponse(BaseModel):
@@ -58,6 +60,8 @@ class UserProfileResponse(BaseModel):
     uuid: str
     email: str
     full_name: str | None = None
+    phone: str | None = None
+    location: str | None = None
     is_active: bool
     is_verified: bool
     created_at: datetime | None = None
@@ -98,7 +102,13 @@ def signup(body: SignupRequest, db: Session = Depends(get_db)):
     if pw_err:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=pw_err)
 
-    # 3. Duplicate check
+    # 3. Phone validation (if provided)
+    if body.phone:
+        phone_err = validate_phone_number(body.phone)
+        if phone_err:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=phone_err)
+
+    # 4. Duplicate check
     existing = UserRepository.get_by_email(db, email=body.email)
     if existing:
         raise HTTPException(
@@ -106,15 +116,27 @@ def signup(body: SignupRequest, db: Session = Depends(get_db)):
             detail="User already exists. Please login.",
         )
 
-    # 4. Hash + store
+    # 5. Hash + store
     hashed = hash_password(body.password)
-    UserRepository.create(
-        db,
-        email=body.email,
-        hashed_password=hashed,
-        full_name=body.full_name or "",
-    )
+    try:
+        UserRepository.create(
+            db,
+            email=body.email,
+            hashed_password=hashed,
+            full_name=body.full_name or "",
+            phone=body.phone,
+            location=body.location,
+        )
+    except Exception as exc:
+        import logging as _logging
+        _logging.getLogger(__name__).error("DB insert failed during signup: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create user account. Please try again.",
+        )
 
+    import logging as _logging
+    _logging.getLogger(__name__).info("User profile saved successfully: %s", body.email)
     return SignupResponse(message="User created successfully")
 
 
@@ -147,21 +169,34 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     # 2. Look up user
     user = UserRepository.get_by_email(db, email=body.email)
 
-    # 3. Not found
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials. Please sign up first.",
-        )
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
 
-    # 4-5. Verify password
-    # In SQLAlchemy models, instance attributes are proxy descriptors at class level
-    # but resolve to python types at instance level. We suppress the static analysis error.
-    if not verify_password(body.password, str(user.hashed_password)):  # type: ignore
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect password.",
-        )
+    # 3. Auto-create account if user does NOT exist
+    if user is None:
+        _log.info("User not found for %s — auto-creating account", body.email)
+        hashed = hash_password(body.password)
+        try:
+            user = UserRepository.create(
+                db,
+                email=body.email,
+                hashed_password=hashed,
+                full_name="",
+            )
+        except Exception as exc:
+            _log.error("DB insert failed during auto-signup: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create user account. Please try again.",
+            )
+        _log.info("User profile saved successfully (auto-signup): %s", body.email)
+    else:
+        # 4-5. Existing user — verify password
+        if not verify_password(body.password, str(user.hashed_password)):  # type: ignore
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect password.",
+            )
 
     # Update last_login timestamp
     try:
@@ -171,7 +206,6 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
 
     # 6. Issue token
     access_token = create_access_token(data={"sub": user.email})
-
     return LoginResponse(access_token=access_token)
 
 

@@ -890,7 +890,7 @@ class LinkedInAutoApply:
             'skill_experience': skill_experience,
         }
 
-    async def _complete_easy_apply_flow(self, user_profile: Dict = None, max_steps: int = 12):
+    async def _complete_easy_apply_flow(self, user_profile: Optional[Dict] = None, max_steps: int = 12):
         """Complete the Easy Apply modal: fill → validate → click Next → detect errors → retry once."""
         if not self.page:
             raise Exception("Browser not initialized")
@@ -937,11 +937,17 @@ class LinkedInAutoApply:
             if 'checkpoint/challenge' in url_lower or 'captcha' in url_lower:
                 raise Exception("Security challenge detected; cannot proceed automatically")
 
+            # ---- FILL CURRENT PAGE ----
+            filler = _make_filler()
+            await filler.fill_application_form()
+            await filler.validate_and_fix()
+
             # ---- SUBMIT (end condition) ----
             submit_btn = await _first_clickable(submit_selectors)
             if submit_btn:
-                filler = _make_filler()
-                await filler.validate_and_fix()
+                # Final validation sweep before submit
+                filler_final = _make_filler()
+                await filler_final.validate_and_fix()
                 logger.info("[APPLY] Submitting application...")
                 await submit_btn.click()
                 await self.human_delay(2, 4)
@@ -951,41 +957,45 @@ class LinkedInAutoApply:
             # ---- REVIEW ----
             review_btn = await _first_clickable(review_selectors)
             if review_btn:
-                filler = _make_filler()
-                await filler.validate_and_fix()
                 logger.info("[APPLY] Clicking Review...")
                 await review_btn.click()
                 await self.human_delay(1.5, 3)
+                # Fill any fields on the review page
                 filler2 = _make_filler()
                 await filler2.fill_application_form()
+                await filler2.validate_and_fix()
                 continue
 
             # ---- NEXT / CONTINUE ----
             next_btn = await _first_clickable(next_selectors)
             if next_btn:
-                # PART 3 — validate BEFORE clicking Next
-                filler = _make_filler()
-                await filler.validate_and_fix()
-
                 logger.info("[APPLY] Clicking Next...")
                 await next_btn.click()
                 await self.human_delay(1.5, 3)
 
-                # PART 4 — detect errors AFTER clicking Next; retry once
+                # Detect errors AFTER clicking Next; retry once
                 filler_post = _make_filler()
                 if await filler_post.has_visible_errors():
-                    logger.info("[APPLY] Errors detected after Next — re-filling & retrying...")
+                    logger.info("[APPLY] Errors detected after Next — re-filling dropdowns & retrying...")
                     await filler_post.fill_application_form()
                     await filler_post.validate_and_fix()
                     await self.human_delay(0.5, 1)
+
+                    # Check if errors persist
+                    if await filler_post.has_visible_errors():
+                        logger.warning("[APPLY] Errors persist after re-fill — doing aggressive dropdown sweep")
+                        # Aggressive: run dropdown handlers one more time
+                        filler_retry = _make_filler()
+                        await filler_retry._fill_custom_dropdowns()
+                        await filler_retry._fix_remaining_select_an_option()
+                        await filler_retry.validate_and_fix()
+                        await self.human_delay(0.3, 0.5)
+
                     # Re-click Next
                     next_btn2 = await _first_clickable(next_selectors)
                     if next_btn2:
                         await next_btn2.click()
                         await self.human_delay(1.5, 3)
-                else:
-                    # No errors — fill new page fields
-                    await filler_post.fill_application_form()
                 continue
 
             # No progression button found

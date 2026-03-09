@@ -3,12 +3,19 @@ Main API routes for AutoAgentHire application.
 Handles job automation, user management, and application tracking.
 """
 from typing import Optional, Dict, Any, List
-from fastapi import APIRouter, HTTPException, BackgroundTasks, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, BackgroundTasks, UploadFile, File, Form, Depends
 from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy.orm import Session
 import logging
 import os
 import json
 from datetime import datetime
+
+from backend.database.connection import get_db
+from backend.database.crud import UserRepository, ResumeRepository
+from backend.auth.dependencies import get_current_user
+from backend.database.models_complete import User
+from backend.auth.validators import validate_email_format, validate_phone_number
 
 logger = logging.getLogger(__name__)
 
@@ -294,70 +301,173 @@ async def stop_agent():
 @router.post("/upload-resume")
 async def upload_resume(
     file: UploadFile = File(...),
-    user_email: str = Form(...)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
-    Upload and process resume for the user.
-    Extracts text, parses structured data, and generates AI summary.
+    Upload and process resume for the authenticated user.
+    Saves the file to uploads/resumes/, persists metadata to the database,
+    and returns parsed resume data.
     """
-    if not file.filename or not file.filename.endswith(('.pdf', '.docx', '.txt')):
-        raise HTTPException(400, "Only PDF, DOCX, and TXT files are supported")
-    
+    if not file.filename or not file.filename.lower().endswith(('.pdf', '.docx')):
+        raise HTTPException(400, "Only PDF and DOCX files are supported")
+
     try:
-        # Save file
+        # Save file to disk
         upload_dir = "uploads/resumes"
         os.makedirs(upload_dir, exist_ok=True)
-        
-        file_path = os.path.join(upload_dir, f"{user_email}_{file.filename}")
-        
+
+        safe_name = f"{current_user.id}_{file.filename}"
+        file_path = os.path.join(upload_dir, safe_name)
+
+        content = await file.read()
+        if not content:
+            raise HTTPException(400, "Uploaded file is empty")
+
         with open(file_path, "wb") as f:
-            content = await file.read()
             f.write(content)
-        
-        logger.info(f"Resume uploaded: {file_path}")
-        
-        # Parse resume with structured extraction
-        from backend.parsers.resume_parser import ResumeParser
-        parser = ResumeParser()
-        parsed_data = parser.parse(file_path)
-        
-        # Extract key information
+
+        file_size = len(content)
+        file_ext = os.path.splitext(file.filename)[1].lower().lstrip(".")
+
+        logger.info(f"Resume uploaded successfully: {file_path} (user_id={current_user.id})")
+
+        # Persist resume metadata to the database
+        try:
+            resume = ResumeRepository.create(
+                db,
+                user_id=int(current_user.id),  # type: ignore
+                filename=file.filename,
+                file_path=file_path,
+                file_size_bytes=file_size,
+                file_type=file_ext,
+            )
+            logger.info("Resume uploaded successfully (DB record id=%s)", resume.id)
+        except Exception as db_exc:
+            logger.error("DB insert failed for resume upload: %s", db_exc)
+            raise HTTPException(
+                status_code=500,
+                detail="Resume file saved but failed to persist metadata to database.",
+            )
+
+        # Parse resume
+        try:
+            from backend.parsers.resume_parser import ResumeParser
+            parser = ResumeParser()
+            parsed_data = parser.parse(file_path)
+        except Exception:
+            parsed_data = {}
+
         resume_text = parsed_data.get("raw_text", "")
         skills = parsed_data.get("skills", [])
         experience = parsed_data.get("experience", [])
         education = parsed_data.get("education", [])
         contact = parsed_data.get("contact", {})
-        
-        # Generate summary using Gemini
-        from backend.llm.gemini_service import get_gemini_service
-        gemini = get_gemini_service()
-        summary = gemini.generate_resume_summary(resume_text)
-        
-        logger.info(f"Resume parsed successfully - Skills: {len(skills)}, Experience: {len(experience)}")
-        
+
         return {
             "status": "success",
+            "resume_id": resume.id,
             "filename": file.filename,
             "file_path": file_path,
             "text_length": len(resume_text),
-            "summary": summary,
             "parsed_data": {
                 "skills": skills,
                 "experience": experience,
                 "education": education,
-                "contact": contact
+                "contact": contact,
             },
             "metadata": {
                 "skills_count": len(skills),
                 "experience_count": len(experience),
-                "education_count": len(education)
-            }
+                "education_count": len(education),
+            },
         }
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error uploading resume: {e}", exc_info=True)
         raise HTTPException(500, f"Failed to process resume: {str(e)}")
 
+
+
+
+# ── User Profile Update ───────────────────────────────────────────────────────
+
+class UserProfileUpdateRequest(BaseModel):
+    full_name: Optional[str] = None
+    phone: Optional[str] = None
+    location: Optional[str] = None
+    skills: Optional[List[str]] = None
+    experience: Optional[str] = None
+
+
+@router.post("/user/profile")
+def update_user_profile(
+    body: UserProfileUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Save or update user profile fields (name, phone, location, skills, experience).
+    Validates phone number format before persisting.
+    """
+    # Phone validation
+    if body.phone:
+        phone_err = validate_phone_number(body.phone)
+        if phone_err:
+            raise HTTPException(status_code=400, detail=phone_err)
+
+    update_fields: Dict[str, Any] = {}
+    if body.full_name is not None:
+        update_fields["full_name"] = body.full_name
+    if body.phone is not None:
+        update_fields["phone"] = body.phone
+    if body.location is not None:
+        update_fields["location"] = body.location
+    if body.skills is not None:
+        update_fields["default_skills"] = body.skills
+    if body.experience is not None:
+        update_fields["default_experience_level"] = body.experience
+
+    try:
+        user = UserRepository.update(db, int(current_user.id), **update_fields)  # type: ignore
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("DB update failed for user profile: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to save user profile. Please try again.")
+
+    logger.info("User profile saved successfully for user_id=%s", current_user.id)
+    return {
+        "status": "success",
+        "message": "User profile saved successfully",
+        "user_id": user.id,
+        "updated_fields": list(update_fields.keys()),
+    }
+
+
+@router.get("/user/profile")
+def get_user_profile(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return the authenticated user's profile."""
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "full_name": current_user.full_name,
+        "phone": current_user.phone,
+        "location": current_user.location,
+        "skills": current_user.default_skills,
+        "experience": current_user.default_experience_level,
+        "created_at": str(current_user.created_at),
+    }
+
+
+# ── Cover Letter ──────────────────────────────────────────────────────────────
 
 @router.post("/generate-cover-letter")
 async def generate_cover_letter(

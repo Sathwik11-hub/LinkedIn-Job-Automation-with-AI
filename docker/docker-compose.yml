@@ -60,23 +60,34 @@ services:
     ports:
       - "8000:8000"
     environment:
+      # Database
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/autoagenthire
       - SYNC_DATABASE_URL=postgresql://postgres:postgres@postgres:5432/autoagenthire
-      - REDIS_URL=redis://redis:6379/0
-      - CHROMA_HOST=chromadb
-      - CHROMA_PORT=8000
+      # Playwright — MUST be set for headless Chromium to work in Docker
+      - PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+      - DISPLAY=:99
+      # App
+      - APP_ENV=production
+      - DEBUG=false
+      # Load secrets from .env file (never hardcode)
+    env_file:
+      - ../.env
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
-        condition: service_healthy
-      chromadb:
-        condition: service_healthy
     volumes:
-      - ../backend:/app/backend
+      # Only mount data dirs — do NOT mount backend/ (it overrides the built image)
       - ../data:/app/data
-      - ../vector_db:/app/vector_db
-    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+      - ../uploads:/app/uploads
+      - playwright_cache:/opt/ms-playwright
+    shm_size: '2gb'
+    command: >
+      gunicorn backend.main:app
+      --workers 1
+      --worker-class uvicorn.workers.UvicornWorker
+      --bind 0.0.0.0:8000
+      --timeout 300
+      --graceful-timeout 30
 
   # Frontend (Streamlit)
   frontend:
@@ -111,6 +122,7 @@ volumes:
   postgres_data:
   redis_data:
   chromadb_data:
+  playwright_cache:
 
 networks:
   default:

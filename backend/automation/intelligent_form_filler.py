@@ -166,6 +166,24 @@ class IntelligentFormFiller:
                              'api integration'],
                 'answer': 'Yes',
             },
+            'deployed_backend': {
+                'patterns': ['deployed backend', 'backend services', 'deployed.*gcp',
+                             'deployed.*aws', 'gcp or aws', 'aws or gcp',
+                             'cloud.*deploy', 'deploy.*cloud'],
+                'answer': 'Yes',
+            },
+            'llm_integration': {
+                'patterns': ['integrated llm', 'llm api', 'openai.*anthropic',
+                             'anthropic.*openai', 'llm.*production',
+                             'integrated.*api.*production', 'production system'],
+                'answer': 'Yes',
+            },
+            'structured_experiments': {
+                'patterns': ['structured experiment', 'run.*experiment',
+                             'improve.*ai.*quality', 'ai output quality',
+                             'output quality.*reliability', 'quality.*reliability'],
+                'answer': 'Yes',
+            },
             'salary': {
                 'patterns': ['salary expectation', 'expected salary', 'compensation expectation',
                              'expectation ctc', 'expected ctc'],
@@ -526,84 +544,462 @@ class IntelligentFormFiller:
 
     # ------------------------------------------------------------------
     #  LINKEDIN CUSTOM DROPDOWNS  (ARIA listbox / combobox)
+    #  Robust 5-strategy handler for React-based LinkedIn dropdowns
     # ------------------------------------------------------------------
+
+    # JS: Collect all visible LinkedIn dropdown containers on the page.
+    # Returns an array of {index, label, currentValue, triggerSelector} objects.
+    JS_FIND_DROPDOWN_CONTAINERS = """
+    () => {
+        const PLACEHOLDERS = new Set([
+            'select an option', 'select', 'choose', 'please select',
+            '--', '- select -', 'pick one', '-- select --',
+            'choose an option', 'select option', ''
+        ]);
+        const results = [];
+
+        // Strategy A: fb-dash-form-element containers with a <select> or button trigger
+        document.querySelectorAll(
+            '.fb-dash-form-element, [data-test-form-builder-select-container]'
+        ).forEach((container, idx) => {
+            if (container.offsetParent === null) return;
+            let labelEl = container.querySelector(
+                'label, legend, [data-test-form-element-label], .fb-dash-form-element__label, span.t-14'
+            );
+            let labelTxt = labelEl ? labelEl.innerText.trim() : '';
+
+            // Dropdown trigger: the clickable element
+            let trigger = container.querySelector(
+                'select, [role="combobox"], [aria-haspopup="listbox"], ' +
+                'button[aria-haspopup], .artdeco-dropdown__trigger'
+            );
+            if (!trigger || trigger.offsetParent === null) return;
+            let curVal = (trigger.innerText || trigger.value || '').trim().toLowerCase();
+            if (!PLACEHOLDERS.has(curVal)) return;  // already answered
+
+            results.push({ index: idx, label: labelTxt, tagName: trigger.tagName.toLowerCase() });
+        });
+
+        // Strategy B: Standalone ARIA triggers not inside fb-dash containers
+        document.querySelectorAll(
+            '[aria-haspopup="listbox"], [role="combobox"], ' +
+            'button[aria-haspopup="listbox"], .artdeco-dropdown__trigger'
+        ).forEach((trigger, idx) => {
+            if (trigger.offsetParent === null) return;
+            let curVal = (trigger.innerText || trigger.value || '').trim().toLowerCase();
+            if (!PLACEHOLDERS.has(curVal)) return;
+
+            // Skip if we already captured this via Strategy A
+            let alreadyCovered = trigger.closest(
+                '.fb-dash-form-element, [data-test-form-builder-select-container]'
+            );
+            if (alreadyCovered) return;
+
+            // Walk up to find label
+            let labelTxt = '';
+            let n = trigger.parentElement;
+            for (let i = 0; i < 8 && n; i++) {
+                let lbl = n.querySelector('label, legend, [data-test-form-element-label]');
+                if (lbl) { labelTxt = lbl.innerText.trim(); break; }
+                let sib = n.previousElementSibling;
+                if (sib && sib.innerText && sib.innerText.trim().length < 300) {
+                    labelTxt = sib.innerText.trim(); break;
+                }
+                n = n.parentElement;
+            }
+            results.push({ index: 1000 + idx, label: labelTxt, standalone: true });
+        });
+
+        return results;
+    }
+    """
+
     async def _fill_custom_dropdowns(self) -> int:
+        """Robust LinkedIn React dropdown handler.
+
+        Detection:
+          1. Scan all .fb-dash-form-element containers for unselected dropdowns.
+          2. Scan standalone [aria-haspopup="listbox"] / [role="combobox"] triggers.
+
+        Opening strategies (tried in order per dropdown):
+          A. Click the trigger element directly.
+          B. Click the container's <select>-like element and wait for listbox.
+          C. Focus + ArrowDown to force-open.
+
+        Selection:
+          - Match smart_defaults / YES_NO heuristic / first-option fallback.
+          - Verify selection stuck; retry once if still placeholder.
+        """
         filled = 0
         try:
-            trigger_els = await self.page.query_selector_all(
+            filled += await self._fill_dropdowns_via_containers()
+            filled += await self._fill_dropdowns_via_aria_triggers()
+        except Exception as e:
+            print(f'   [FORM] Custom dropdown err: {e}')
+        return filled
+
+    async def _fill_dropdowns_via_containers(self) -> int:
+        """Strategy 1: Find LinkedIn form-element containers with dropdown triggers."""
+        filled = 0
+        try:
+            containers = await self.page.query_selector_all(
+                '.fb-dash-form-element, '
+                '[data-test-form-builder-select-container]'
+            )
+            for container in containers:
+                try:
+                    if not await container.is_visible():
+                        continue
+                    result = await self._handle_single_dropdown_container(container)
+                    if result:
+                        filled += 1
+                except Exception as e:
+                    print(f'   [FORM] Container dropdown err: {str(e)[:80]}')
+                    try:
+                        await self.page.keyboard.press('Escape')
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return filled
+
+    async def _handle_single_dropdown_container(self, container: ElementHandle) -> bool:
+        """Process a single .fb-dash-form-element dropdown container.
+        Returns True if we successfully selected a value."""
+
+        # Find the trigger element inside the container
+        trigger = None
+        for sel in [
+            'select',
+            '[role="combobox"]',
+            '[aria-haspopup="listbox"]',
+            'button[aria-haspopup]',
+            '.artdeco-dropdown__trigger',
+            'button',  # last resort — any button inside the form element
+        ]:
+            trigger = await container.query_selector(sel)
+            if trigger and await trigger.is_visible():
+                break
+            trigger = None
+
+        if not trigger:
+            return False
+
+        # Check current value — skip if already answered
+        cur_text = await self._get_trigger_display_text(trigger)
+        if cur_text.lower() not in PLACEHOLDER_TEXTS:
+            return False  # already has a real selection
+
+        # Get question label from the container
+        label = await self._get_container_label(container)
+
+        # If it's a native <select>, delegate to the native handler
+        tag = (await trigger.evaluate('el => el.tagName')).lower()
+        if tag == 'select':
+            opts = await self._collect_select_options(trigger)
+            if opts:
+                opt_texts = [t for t, _ in opts]
+                opt_values = [v for _, v in opts]
+                chosen = self._pick_dropdown_answer(label, opt_texts, opt_values)
+                if chosen and await self._set_native_select(trigger, chosen, opt_texts, opt_values):
+                    print(f'   [FORM] Select(container): "{label[:40]}" -> "{chosen[:20]}"')
+                    return True
+            return False
+
+        # React dropdown — open, select, verify
+        return await self._open_and_select_react_dropdown(trigger, label)
+
+    async def _fill_dropdowns_via_aria_triggers(self) -> int:
+        """Strategy 2: Find standalone ARIA dropdown triggers not inside containers."""
+        filled = 0
+        try:
+            triggers = await self.page.query_selector_all(
                 '[aria-haspopup="listbox"], '
                 '[role="combobox"], '
+                'button[aria-haspopup="listbox"], '
                 '.artdeco-dropdown__trigger'
             )
-
-            for trigger in trigger_els:
+            for trigger in triggers:
                 try:
                     if not await trigger.is_visible():
                         continue
-                    cur = (await trigger.inner_text()).strip().lower()
-                    if cur not in PLACEHOLDER_TEXTS:
-                        continue  # already has a real selection
+
+                    # Skip if inside a container we already processed
+                    in_container = await trigger.evaluate(
+                        'el => !!el.closest(".fb-dash-form-element, '
+                        '[data-test-form-builder-select-container]")'
+                    )
+                    if in_container:
+                        continue
+
+                    cur_text = await self._get_trigger_display_text(trigger)
+                    if cur_text.lower() not in PLACEHOLDER_TEXTS:
+                        continue
 
                     label = await self._label(trigger)
-
-                    # Click to open — with one retry
-                    for attempt in range(2):
-                        await trigger.click()
-                        await asyncio.sleep(0.4 + attempt * 0.3)
-                        listbox = await self.page.query_selector('[role="listbox"]:visible')
-                        if listbox:
-                            break
-
-                    if not listbox:
-                        await self.page.keyboard.press('Escape')
-                        continue
-
-                    option_els = await listbox.query_selector_all('[role="option"]')
-                    if not option_els:
-                        await self.page.keyboard.press('Escape')
-                        continue
-
-                    # Build option map — skip placeholders
-                    opt_map: List[Tuple[str, ElementHandle]] = []
-                    for oel in option_els:
-                        t = (await oel.inner_text()).strip()
-                        if t and t.lower() not in PLACEHOLDER_TEXTS:
-                            opt_map.append((t, oel))
-
-                    if not opt_map:
-                        await self.page.keyboard.press('Escape')
-                        continue
-
-                    opt_texts = [t for t, _ in opt_map]
-                    desired = self._pick_dropdown_answer(label, opt_texts, opt_texts)
-
-                    chosen_el = None
-                    if desired:
-                        dl = desired.lower()
-                        for t, el in opt_map:
-                            if t.lower() == dl or dl in t.lower():
-                                chosen_el = el
-                                break
-
-                    # Fallback: prefer Yes, else first real option
-                    if not chosen_el:
-                        yes_opts = [(t, e) for t, e in opt_map if t.lower() in ('yes', 'y')]
-                        chosen_el = yes_opts[0][1] if yes_opts else opt_map[0][1]
-
-                    await chosen_el.click()
-                    await asyncio.sleep(0.3)
-                    chosen_text = (await chosen_el.inner_text()).strip()
-                    filled += 1
-                    print(f'   [FORM] Dropdown: "{label[:40]}" -> "{chosen_text[:20]}"')
-
+                    if await self._open_and_select_react_dropdown(trigger, label):
+                        filled += 1
                 except Exception:
                     try:
                         await self.page.keyboard.press('Escape')
                     except Exception:
                         pass
-        except Exception as e:
-            print(f'   [FORM] Custom dropdown err: {e}')
+        except Exception:
+            pass
         return filled
+
+    async def _get_trigger_display_text(self, trigger: ElementHandle) -> str:
+        """Get the currently displayed text of a dropdown trigger."""
+        try:
+            # Try innerText first (works for React dropdowns showing "Select an option")
+            text = (await trigger.inner_text()).strip()
+            if text:
+                return text
+            # Fallback: value property (for <select> or input-based triggers)
+            val = await trigger.evaluate('el => el.value || ""')
+            return val.strip()
+        except Exception:
+            return ""
+
+    async def _get_container_label(self, container: ElementHandle) -> str:
+        """Extract the question label from a form-element container."""
+        try:
+            label_el = await container.query_selector(
+                'label, legend, '
+                '[data-test-form-element-label], '
+                '.fb-dash-form-element__label, '
+                'span.t-14.t-bold'
+            )
+            if label_el:
+                text = (await label_el.inner_text()).strip()
+                if text:
+                    return text
+            # Fallback: walk up to find label via JS
+            return await container.evaluate("""
+                el => {
+                    let lbl = el.querySelector('label, legend, span.t-14');
+                    if (lbl && lbl.innerText.trim()) return lbl.innerText.trim();
+                    let prev = el.previousElementSibling;
+                    if (prev && prev.innerText && prev.innerText.trim().length < 300)
+                        return prev.innerText.trim();
+                    return '';
+                }
+            """)
+        except Exception:
+            return ""
+
+    async def _open_and_select_react_dropdown(
+        self, trigger: ElementHandle, label: str
+    ) -> bool:
+        """Open a React/ARIA dropdown, select the best option, verify it stuck.
+        Returns True on success."""
+
+        for attempt in range(2):  # retry once if selection doesn't stick
+            option_els = await self._open_dropdown(trigger)
+            if not option_els:
+                if attempt == 0:
+                    print(f'   [FORM] Dropdown "{label[:40]}" — could not open, retrying...')
+                    await asyncio.sleep(0.5)
+                    continue
+                print(f'   [FORM] Dropdown "{label[:40]}" — failed to open after retry')
+                return False
+
+            # Build option map
+            opt_map: List[Tuple[str, ElementHandle]] = []
+            for oel in option_els:
+                try:
+                    t = (await oel.inner_text()).strip()
+                    if t and t.lower() not in PLACEHOLDER_TEXTS:
+                        opt_map.append((t, oel))
+                except Exception:
+                    continue
+
+            if not opt_map:
+                await self._close_dropdown()
+                print(f'   [FORM] Dropdown "{label[:40]}" — no valid options found')
+                return False
+
+            opt_texts = [t for t, _ in opt_map]
+            desired = self._pick_dropdown_answer(label, opt_texts, opt_texts)
+
+            # Find the best matching option element
+            chosen_el = None
+            chosen_text = ""
+            if desired:
+                dl = desired.lower()
+                # Exact match first
+                for t, el in opt_map:
+                    if t.lower() == dl:
+                        chosen_el = el
+                        chosen_text = t
+                        break
+                # Partial match
+                if not chosen_el:
+                    for t, el in opt_map:
+                        if dl in t.lower() or t.lower() in dl:
+                            chosen_el = el
+                            chosen_text = t
+                            break
+
+            # Fallback: prefer "Yes", then first real option
+            if not chosen_el:
+                for t, el in opt_map:
+                    if t.lower() in ('yes', 'y'):
+                        chosen_el = el
+                        chosen_text = t
+                        break
+                if not chosen_el:
+                    chosen_el = opt_map[0][1]
+                    chosen_text = opt_map[0][0]
+
+            # Click the option
+            try:
+                await chosen_el.scroll_into_view_if_needed()
+                await asyncio.sleep(0.1)
+                await chosen_el.click()
+                await asyncio.sleep(0.4)
+            except Exception:
+                # Fallback: click via JS
+                try:
+                    await chosen_el.evaluate('el => el.click()')
+                    await asyncio.sleep(0.4)
+                except Exception:
+                    await self._close_dropdown()
+                    continue
+
+            # Verify the selection stuck
+            verify_text = await self._get_trigger_display_text(trigger)
+            if verify_text.lower() in PLACEHOLDER_TEXTS:
+                if attempt == 0:
+                    print(f'   [FORM] Dropdown "{label[:40]}" — selection didn\'t stick, retrying...')
+                    await asyncio.sleep(0.3)
+                    continue  # retry
+                else:
+                    print(f'   [FORM] Dropdown "{label[:40]}" — STILL placeholder after retry')
+                    return False
+
+            print(f'   [FORM] Dropdown: "{label[:40]}" -> "{chosen_text[:30]}"')
+            return True
+
+        return False
+
+    async def _open_dropdown(self, trigger: ElementHandle) -> List[ElementHandle]:
+        """Try multiple strategies to open a dropdown and return option elements.
+
+        Strategies:
+          1. Direct click on trigger → wait for [role="option"]
+          2. Focus + ArrowDown → wait for [role="option"]
+          3. Click trigger + look for visible <div> options with data-test attrs
+        """
+        page = self.page
+
+        # -- Strategy 1: Direct click --
+        try:
+            await trigger.click()
+            await asyncio.sleep(0.5)
+            options = await self._collect_visible_options()
+            if options:
+                return options
+        except Exception:
+            pass
+
+        # -- Strategy 2: Focus + ArrowDown --
+        try:
+            await trigger.focus()
+            await asyncio.sleep(0.15)
+            await page.keyboard.press('ArrowDown')
+            await asyncio.sleep(0.5)
+            options = await self._collect_visible_options()
+            if options:
+                return options
+        except Exception:
+            pass
+
+        # -- Strategy 3: Click again + longer wait --
+        try:
+            await trigger.click()
+            await asyncio.sleep(1.0)
+            options = await self._collect_visible_options()
+            if options:
+                return options
+        except Exception:
+            pass
+
+        # -- Strategy 4: JS dispatch mousedown + click events --
+        try:
+            await trigger.evaluate("""
+                el => {
+                    el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+                    el.dispatchEvent(new MouseEvent('mouseup',   {bubbles: true}));
+                    el.dispatchEvent(new MouseEvent('click',     {bubbles: true}));
+                }
+            """)
+            await asyncio.sleep(0.7)
+            options = await self._collect_visible_options()
+            if options:
+                return options
+        except Exception:
+            pass
+
+        return []
+
+    async def _collect_visible_options(self) -> List[ElementHandle]:
+        """Collect all visible [role="option"] elements anywhere on the page."""
+        try:
+            # Primary: standard ARIA options
+            options = await self.page.query_selector_all('[role="option"]')
+            visible = []
+            for opt in options:
+                try:
+                    if await opt.is_visible():
+                        visible.append(opt)
+                except Exception:
+                    continue
+            if visible:
+                return visible
+
+            # Fallback: LinkedIn sometimes uses [role="listbox"] > div without role="option"
+            listboxes = await self.page.query_selector_all('[role="listbox"]')
+            for lb in listboxes:
+                try:
+                    if not await lb.is_visible():
+                        continue
+                    children = await lb.query_selector_all('div, li, span')
+                    for child in children:
+                        try:
+                            text = (await child.inner_text()).strip()
+                            if text and await child.is_visible() and text.lower() not in PLACEHOLDER_TEXTS:
+                                visible.append(child)
+                        except Exception:
+                            continue
+                    if visible:
+                        return visible
+                except Exception:
+                    continue
+
+            # Fallback: artdeco-dropdown__content items
+            dropdown_items = await self.page.query_selector_all(
+                '.artdeco-dropdown__content li, '
+                '.artdeco-dropdown__content [role="option"], '
+                '.artdeco-dropdown__content button'
+            )
+            for item in dropdown_items:
+                try:
+                    if await item.is_visible():
+                        visible.append(item)
+                except Exception:
+                    continue
+            return visible
+        except Exception:
+            return []
+
+    async def _close_dropdown(self):
+        """Close any open dropdown by pressing Escape."""
+        try:
+            await self.page.keyboard.press('Escape')
+            await asyncio.sleep(0.2)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     #  RADIO BUTTONS
@@ -620,7 +1016,7 @@ class IntelligentFormFiller:
 
             for _, group in groups.items():
                 try:
-                    if any(await r.is_checked() for r in group):
+                    if any([await r.is_checked() for r in group]):
                         continue
                     label = await self._label(group[0])
                     opts: List[str] = []
@@ -737,6 +1133,7 @@ class IntelligentFormFiller:
     async def _fix_unselected_dropdowns(self) -> int:
         fixed = 0
         try:
+            # 1. Fix native <select> dropdowns
             for sel in await self.page.query_selector_all('select'):
                 try:
                     if not await sel.is_visible():
@@ -760,8 +1157,72 @@ class IntelligentFormFiller:
                 except Exception:
                     continue
 
-            # Also attempt custom ARIA dropdowns
+            # 2. Fix React/ARIA custom dropdowns (the main fix for LinkedIn)
             fixed += await self._fill_custom_dropdowns()
+
+            # 3. Last resort: scan for any remaining "Select an option" text on page
+            fixed += await self._fix_remaining_select_an_option()
+        except Exception:
+            pass
+        return fixed
+
+    async def _fix_remaining_select_an_option(self) -> int:
+        """Last-resort scan: find any visible element showing 'Select an option'
+        that we haven't handled yet, and try to click+select."""
+        fixed = 0
+        try:
+            # Find all elements whose text content is exactly "Select an option"
+            candidates = await self.page.query_selector_all(
+                'button, [role="combobox"], [aria-haspopup="listbox"], '
+                'span, div'
+            )
+            for el in candidates:
+                try:
+                    if not await el.is_visible():
+                        continue
+                    text = (await el.inner_text()).strip().lower()
+                    if text != 'select an option':
+                        continue
+
+                    # This element still says "Select an option" — try to fix it
+                    label = await self._label(el)
+
+                    # Check if this element IS the trigger (clickable)
+                    tag = (await el.evaluate('el => el.tagName')).lower()
+                    is_clickable = tag in ('button', 'select') or await el.evaluate(
+                        'el => el.hasAttribute("role") || el.hasAttribute("aria-haspopup")'
+                    )
+
+                    trigger = el if is_clickable else None
+                    if not trigger:
+                        # Walk up to find clickable parent
+                        js_handle = await el.evaluate_handle("""
+                            el => {
+                                let n = el.parentElement;
+                                for (let i = 0; i < 5 && n; i++) {
+                                    if (n.getAttribute('role') === 'combobox' ||
+                                        n.getAttribute('aria-haspopup') === 'listbox' ||
+                                        n.tagName === 'BUTTON' || n.tagName === 'SELECT') {
+                                        return n;
+                                    }
+                                    n = n.parentElement;
+                                }
+                                return null;
+                            }
+                        """)
+                        if not js_handle or await js_handle.evaluate('el => el === null'):
+                            continue
+                        trigger = js_handle.as_element()
+                        if not trigger:
+                            continue
+
+                    if await self._open_and_select_react_dropdown(trigger, label):
+                        fixed += 1
+                except Exception:
+                    try:
+                        await self.page.keyboard.press('Escape')
+                    except Exception:
+                        pass
         except Exception:
             pass
         return fixed

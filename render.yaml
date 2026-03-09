@@ -3,6 +3,10 @@ services:
     name: linkedin-automation-backend
     env: python
     region: oregon
+    # MINIMUM: standard (2GB RAM). Free tier (512MB) will OOM during startup.
+    # sentence-transformers/PyTorch is excluded via requirements-prod.txt,
+    # but faiss + sklearn + langgraph still need ~1.5GB at peak startup.
+    plan: standard
     rootDir: .
     buildCommand: "./build.sh"
     startCommand: "PYTHONPATH=. gunicorn backend.main:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 300 --graceful-timeout 30"
@@ -17,6 +21,9 @@ services:
         value: "false"
       - key: API_RELOAD
         value: "false"
+      # Disable heavy local vector store on cloud — use Qdrant Cloud instead
+      - key: DISABLE_LOCAL_VECTOR_STORE
+        value: "true"
       # Set these in the Render dashboard (do NOT commit secrets to this file):
       # - key: DATABASE_URL           (Supabase pooler: postgresql://postgres.REF:PASS@aws-1-REGION.pooler.supabase.com:6543/postgres)
       # - key: SYNC_DATABASE_URL      (same as DATABASE_URL)

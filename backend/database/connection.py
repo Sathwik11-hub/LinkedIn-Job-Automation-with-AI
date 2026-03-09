@@ -94,6 +94,44 @@ engine, DATABASE_URL = _resolve_engine()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
+# Column migrations — ADD COLUMN IF NOT EXISTS is idempotent on PostgreSQL.
+# SQLite does not support IF NOT EXISTS on ALTER TABLE, so we catch and ignore errors there.
+_COLUMN_MIGRATIONS = [
+    # (table, column, definition)
+    ("users", "phone",    "VARCHAR(50)"),
+    ("users", "location", "VARCHAR(255)"),
+]
+
+
+def _run_migrations():
+    """Apply any missing column additions to existing tables."""
+    is_sqlite = DATABASE_URL.startswith("sqlite")
+    with engine.connect() as conn:
+        for table, column, definition in _COLUMN_MIGRATIONS:
+            try:
+                if is_sqlite:
+                    # SQLite: check information_schema equivalent
+                    result = conn.execute(text(f"PRAGMA table_info({table})"))
+                    cols = [row[1] for row in result]
+                    if column in cols:
+                        continue
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}"))
+                else:
+                    conn.execute(text(
+                        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}"
+                    ))
+                conn.commit()
+                print(f"[DB] Migration: added column {table}.{column}")
+            except Exception as exc:
+                conn.rollback()
+                msg = str(exc).lower()
+                # "already exists" or "duplicate column" — safe to ignore
+                if "already exists" in msg or "duplicate column" in msg:
+                    pass
+                else:
+                    print(f"[DB] Migration warning ({table}.{column}): {str(exc).splitlines()[0]}")
+
+
 def init_db():
     """Initialize database tables — creates all tables if they don't exist."""
     try:
@@ -103,6 +141,12 @@ def init_db():
     except Exception as e:
         print("[DB] WARNING - Table initialization error: " + str(e))
         print("Continuing without database initialization...")
+
+    # Always run column migrations so new columns are added to pre-existing tables
+    try:
+        _run_migrations()
+    except Exception as e:
+        print("[DB] WARNING - Migration error: " + str(e))
 
 
 def drop_db():

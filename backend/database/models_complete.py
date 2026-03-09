@@ -43,6 +43,8 @@ class User(Base):
     email = Column(String(255), unique=True, nullable=False, index=True)
     hashed_password = Column(String(255), nullable=False)
     full_name = Column(String(255))
+    phone = Column(String(50))
+    location = Column(String(255))
     is_active = Column(Boolean, default=True)
     is_verified = Column(Boolean, default=False)
     email_verified_at = Column(DateTime(timezone=True))
