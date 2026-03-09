@@ -2,12 +2,16 @@
 Database setup script.
 Initializes the PostgreSQL database and creates tables.
 """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import asyncio
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from backend.config import settings
-from backend.database.models import Base
+from backend.database.models_complete import Base
 
 
 async def init_db():

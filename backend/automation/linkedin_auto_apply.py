@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
 
-import PyPDF2
+from pypdf import PdfReader as _PdfReader
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 from dotenv import load_dotenv
 
@@ -43,7 +43,6 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('linkedin_automation.log'),
         logging.StreamHandler()
     ]
 )
@@ -174,10 +173,10 @@ class LinkedInAutoApply:
         """Extract text from PDF resume."""
         try:
             with open(self.resume_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
+                pdf_reader = _PdfReader(file)
                 text = ""
                 for page in pdf_reader.pages:
-                    text += page.extract_text()
+                    text += page.extract_text() or ""
                 return text
         except Exception as e:
             logger.error(f"❌ Error parsing PDF resume: {e}")
