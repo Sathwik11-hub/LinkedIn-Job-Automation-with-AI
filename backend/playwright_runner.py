@@ -64,31 +64,42 @@ MAX_LOOP_PER_PAGE   = 10        # absolute cap on fill iterations per step
 # SECTION 3 – AI FIELD HANDLER
 # ═══════════════════════════════════════════════════════════════════════════
 _ai_cache: dict = {}            # label_key → answer  (persists across steps)
+_runtime_ai_cfg: dict = {}      # set from incoming request config
 
 
 def _get_ai_config() -> dict | None:
-    """Return {url, key, model} for the first available AI provider."""
-    gh = os.environ.get("GITHUB_API_KEY", "")
-    groq = os.environ.get("groq_api_key", "") or os.environ.get("GROQ_API_KEY", "")
-    oai = os.environ.get("OPENAI_API_KEY", "")
+    """Return {url, key, model} from runtime AI config only.
 
-    if gh and gh.startswith("ghp_"):
+    Optional AI mode is enabled only when frontend provides a valid key.
+    """
+    if not _runtime_ai_cfg.get("use_ai"):
+        return None
+
+    provider = str(_runtime_ai_cfg.get("provider", "none") or "none").lower()
+    gemini_key = str(_runtime_ai_cfg.get("gemini_api_key", "") or "")
+    groq_key = str(_runtime_ai_cfg.get("groq_api_key", "") or "")
+    openai_key = str(_runtime_ai_cfg.get("openai_api_key", "") or "")
+
+    if provider == "gemini" and gemini_key:
         return {
-            "url":   "https://models.inference.ai.azure.com/chat/completions",
-            "key":   gh,
-            "model": "gpt-4o-mini",
+            "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+            "key": gemini_key,
+            "model": "gemini-2.5-flash",
+            "provider": "gemini",
         }
-    if groq and groq.startswith("gsk_"):
+    if provider == "groq" and groq_key:
         return {
-            "url":   "https://api.groq.com/openai/v1/chat/completions",
-            "key":   groq,
+            "url": "https://api.groq.com/openai/v1/chat/completions",
+            "key": groq_key,
             "model": "llama-3.3-70b-versatile",
+            "provider": "groq",
         }
-    if oai and not oai.startswith("your_"):
+    if provider == "openai" and openai_key:
         return {
-            "url":   "https://api.openai.com/v1/chat/completions",
-            "key":   oai,
+            "url": "https://api.openai.com/v1/chat/completions",
+            "key": openai_key,
             "model": os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+            "provider": "openai",
         }
     return None
 
@@ -98,19 +109,28 @@ def _call_ai_sync(prompt: str) -> str:
     cfg = _get_ai_config()
     if not cfg:
         return ""
-    body = json.dumps({
-        "model":       cfg["model"],
-        "messages":    [{"role": "user", "content": prompt}],
-        "max_tokens":  150,
-        "temperature": 0.3,
-    }).encode()
+    if cfg.get("provider") == "gemini":
+        body = json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.3,
+                "maxOutputTokens": 150,
+            },
+        }).encode()
+    else:
+        body = json.dumps({
+            "model": cfg["model"],
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 150,
+            "temperature": 0.3,
+        }).encode()
 
     req = urllib.request.Request(
-        cfg["url"],
+        cfg["url"] + (f"?key={cfg['key']}" if cfg.get("provider") == "gemini" else ""),
         data=body,
         headers={
             "Content-Type":  "application/json",
-            "Authorization": f"Bearer {cfg['key']}",
+            **({"Authorization": f"Bearer {cfg['key']}"} if cfg.get("provider") != "gemini" else {}),
         },
         method="POST",
     )
@@ -118,7 +138,15 @@ def _call_ai_sync(prompt: str) -> str:
     try:
         with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
             data = json.loads(resp.read().decode())
-            ans = data["choices"][0]["message"]["content"].strip().strip("\"'`")
+            if cfg.get("provider") == "gemini":
+                ans = (
+                    data.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                ).strip().strip("\"'`")
+            else:
+                ans = data["choices"][0]["message"]["content"].strip().strip("\"'`")
             if "\n" in ans:
                 ans = ans.split("\n")[0].strip()
             return ans
@@ -133,10 +161,12 @@ async def ai_answer_field(
     user_profile: dict,
     resume_text: str = "",
     validation_hint: str = "",
+    field_type: str = "text",
+    options: list[str] | None = None,
 ) -> str:
     """Generate a concise answer for an unknown form field.
     Called AT MOST ONCE per unique label (result is cached)."""
-    key = label.lower().strip()
+    key = f"{label.lower().strip()}::{field_type}"
     if key in _ai_cache:
         return _ai_cache[key]
 
@@ -162,10 +192,20 @@ async def ai_answer_field(
 
     hint_line = f'\nValidation hint from site: "{validation_hint}"' if validation_hint else ""
 
+    if field_type == "numeric":
+        type_rule = "Return ONLY digits (or digits with one decimal point)."
+    elif field_type == "dropdown" and options:
+        type_rule = "Return ONLY one of these options exactly: " + ", ".join(options[:20])
+    elif field_type == "yes_no":
+        type_rule = "Return ONLY Yes or No."
+    else:
+        type_rule = "Return a short professional answer (1 to 10 words)."
+
     prompt = (
         "You are filling a job-application form. Return ONLY the value to type "
         "into the field – no explanation, no quotes, no extra text.\n\n"
         f'Field label: "{label}"\n'
+        f'Field type: "{field_type}"\n'
         f'Job title being applied for: "{job_title}"\n'
         f"Applicant profile:\n{profile_lines}\n"
     )
@@ -174,13 +214,13 @@ async def ai_answer_field(
     prompt += hint_line
     prompt += (
         "\n\nRules:\n"
-        "- Numeric field (percentage, year, salary, CTC) → return digits only.\n"
+        f"- {type_rule}\n"
         "- Date field (DOB) → use MM/DD/YYYY. Estimate from experience years.\n"
         "- Yes/No → return Yes or No.\n"
         "- City/State → use applicant location.\n"
         "- College/University → use resume data or return a plausible name.\n"
         "- Short text (cover letter, reason) → 1-2 sentences max.\n"
-        "- If truly unknown, return N/A.\n"
+        "- If truly unknown, return an empty response.\n"
         "Return ONLY the value."
     )
 
@@ -190,6 +230,7 @@ async def ai_answer_field(
         print(f"    [AI] thread error: {str(e)[:50]}")
         ans = ""
 
+    ans = _sanitize_ai_answer(ans, field_type, options)
     _ai_cache[key] = ans
     if ans:
         print(f"    [AI] '{label[:40]}' → '{ans[:35]}'")
@@ -564,6 +605,62 @@ def _resolve_yes_no(label: str, profile: dict) -> str:
     return "yes"
 
 
+def _infer_field_type(label: str) -> str:
+    lb = (label or "").lower()
+    if any(x in lb for x in ("are you", "do you", "have you", "will you", "can you", "willing", "authorized", "sponsorship")):
+        return "yes_no"
+    if any(x in lb for x in ("year", "years", "experience", "salary", "ctc", "compensation", "cgpa", "gpa", "grade", "percentage", "notice")):
+        return "numeric"
+    return "text"
+
+
+def _sanitize_ai_answer(answer: str, field_type: str, options: list[str] | None = None) -> str:
+    a = (answer or "").strip().strip('"\'`')
+    if not a:
+        return ""
+    if field_type == "yes_no":
+        low = a.lower()
+        if low in ("yes", "y", "true", "1"):
+            return "yes"
+        if low in ("no", "n", "false", "0"):
+            return "no"
+        return ""
+    if field_type == "numeric":
+        m = re.search(r"\d+(?:\.\d+)?", a)
+        return m.group(0) if m else ""
+    if field_type == "dropdown" and options:
+        al = a.lower()
+        for opt in options:
+            ol = opt.lower().strip()
+            if al == ol:
+                return opt
+        for opt in options:
+            ol = opt.lower().strip()
+            if al in ol or ol in al:
+                return opt
+        return ""
+    return a[:120]
+
+
+def _fallback_unknown_answer(label: str, profile: dict, field_type: str) -> str:
+    lb = (label or "").lower()
+    if field_type == "yes_no":
+        return "yes"
+    if field_type == "numeric":
+        if "cgpa" in lb or "gpa" in lb:
+            return str(profile.get("cgpa") or profile.get("gpa") or "8")
+        if "experience" in lb or "year" in lb:
+            return str(profile.get("years_experience") or "1")
+        if "salary" in lb or "ctc" in lb or "compensation" in lb:
+            return str(profile.get("expected_salary") or profile.get("expected_ctc") or "0")
+        return "1"
+    if "experience" in lb and profile.get("years_experience"):
+        return f"{profile.get('years_experience')} years"
+    if "skill" in lb and profile.get("skill_set"):
+        return str(profile.get("skill_set"))[:120]
+    return "Yes"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 7 – LABEL DETECTION
 # ═══════════════════════════════════════════════════════════════════════════
@@ -717,11 +814,15 @@ async def fill_form_fields_js(
             if not tracker.ai_was_called_for(label) and label:
                 tracker.mark_ai_called(label)
                 hint = await _get_nearby_error(page, elem)
-                fill_val = await ai_answer_field(label, job_title, profile, resume_text, hint)
+                ftype = _infer_field_type(label)
+                fill_val = await ai_answer_field(label, job_title, profile, resume_text, hint, ftype)
             else:
                 # AI already called and returned empty – skip
                 tracker.mark_done(fid, "")
                 continue
+
+        if not fill_val:
+            fill_val = _fallback_unknown_answer(label, profile, _infer_field_type(label))
 
         if not fill_val or not str(fill_val).strip():
             tracker.mark_done(fid, "")
@@ -807,7 +908,11 @@ async def fill_form_sections(
                 if not fill_val and not tracker.ai_was_called_for(q) and q:
                     tracker.mark_ai_called(q)
                     hint = await _get_nearby_error(page, inp)
-                    fill_val = await ai_answer_field(q, job_title, profile, resume_text, hint)
+                    ftype = _infer_field_type(q)
+                    fill_val = await ai_answer_field(q, job_title, profile, resume_text, hint, ftype)
+
+                if not fill_val:
+                    fill_val = _fallback_unknown_answer(q, profile, _infer_field_type(q))
 
                 if fill_val and (is_ct or not cur):
                     try:
@@ -847,7 +952,10 @@ async def fill_form_sections(
 
                 if not fill_val and not tracker.ai_was_called_for(q) and q:
                     tracker.mark_ai_called(q)
-                    fill_val = await ai_answer_field(q, job_title, profile, resume_text)
+                    fill_val = await ai_answer_field(q, job_title, profile, resume_text, field_type="text")
+
+                if not fill_val:
+                    fill_val = _fallback_unknown_answer(q, profile, "text")
 
                 if fill_val:
                     try:
@@ -883,7 +991,7 @@ async def fill_form_sections(
                                              "can you", "do you", "are you", "have you")):
                     if not tracker.ai_was_called_for(q) and q:
                         tracker.mark_ai_called(q)
-                        ai_ans = await ai_answer_field(q, job_title, profile, resume_text)
+                        ai_ans = await ai_answer_field(q, job_title, profile, resume_text, field_type="yes_no", options=["yes", "no"])
                         if ai_ans and ai_ans.lower().strip() in ("no", "n"):
                             desired = "no"
                         else:
@@ -958,13 +1066,17 @@ async def _fill_select_dropdowns(page, profile, tracker, job_title="", resume_te
                 val = await _pick_dropdown_value(lbl, opts, profile)
                 if not val and not tracker.ai_was_called_for(lbl) and lbl:
                     tracker.mark_ai_called(lbl)
-                    ai_ans = await ai_answer_field(lbl, job_title, profile, resume_text)
+                    option_texts = [((await o.text_content()) or "").strip() for o in opts]
+                    ai_ans = await ai_answer_field(lbl, job_title, profile, resume_text, field_type="dropdown", options=option_texts)
                     if ai_ans:
                         for o in opts:
                             ot = (await o.text_content() or "").strip().lower()
                             if ai_ans.lower() in ot or ot in ai_ans.lower():
                                 val = await o.get_attribute("value") or ""
                                 break
+                if not val:
+                    # Deterministic fallback: first non-placeholder option.
+                    val = await _pick_dropdown_value(lbl, opts, profile)
                 if val:
                     await sel.select_option(val, timeout=FIELD_TIMEOUT)
                     tracker.mark_done(fid, val)
@@ -1016,13 +1128,21 @@ async def _fill_custom_dropdowns(page, profile, tracker, job_title="", resume_te
 
                 if not chosen and not tracker.ai_was_called_for(lbl) and lbl:
                     tracker.mark_ai_called(lbl)
-                    ai_ans = await ai_answer_field(lbl, job_title, profile, resume_text)
+                    option_texts = [((await o.text_content()) or "").strip() for o in opts]
+                    ai_ans = await ai_answer_field(lbl, job_title, profile, resume_text, field_type="dropdown", options=option_texts)
                     if ai_ans:
                         for o in opts:
                             ot = (await o.text_content() or "").strip().lower()
                             if ai_ans.lower() in ot or ot in ai_ans.lower():
                                 chosen = o
                                 break
+
+                if not chosen and opts:
+                    for o in opts:
+                        ot = ((await o.text_content()) or "").strip().lower()
+                        if ot and ot not in ("select", "select an option", "choose", "--"):
+                            chosen = o
+                            break
 
                 if chosen:
                     await chosen.click(timeout=FIELD_TIMEOUT)
@@ -1273,6 +1393,16 @@ async def has_validation_errors(page: Page) -> bool:
 
 async def run_automation(config_json: str):
     config = json.loads(config_json)
+    global _runtime_ai_cfg, _ai_cache
+    _ai_cache = {}
+    ai_cfg = config.get("ai_config", {}) if isinstance(config.get("ai_config", {}), dict) else {}
+    _runtime_ai_cfg = {
+        "use_ai": bool(ai_cfg.get("use_ai", False)),
+        "provider": str(ai_cfg.get("provider", "none") or "none").lower(),
+        "gemini_api_key": str(ai_cfg.get("gemini_api_key", "") or ""),
+        "groq_api_key": str(ai_cfg.get("groq_api_key", "") or ""),
+        "openai_api_key": str(ai_cfg.get("openai_api_key", "") or ""),
+    }
 
     # ── build profile ──
     profile = config.get("user_profile", {})
@@ -1292,7 +1422,10 @@ async def run_automation(config_json: str):
     print(f"[PROFILE] Title: {profile.get('current_title')} | Company: {profile.get('current_company')}")
 
     ai_cfg = _get_ai_config()
-    print(f"[AI] Provider: {'GitHub Models' if ai_cfg and 'github' in ai_cfg['url'] else 'Groq' if ai_cfg and 'groq' in ai_cfg['url'] else 'OpenAI' if ai_cfg else 'NONE'}")
+    provider_name = "NONE"
+    if ai_cfg:
+        provider_name = str(ai_cfg.get("provider", "UNKNOWN")).upper()
+    print(f"[AI] Provider: {provider_name}")
 
     result = {"status": "failed", "phase": "", "jobs_found": 0, "applications": [], "errors": []}
 

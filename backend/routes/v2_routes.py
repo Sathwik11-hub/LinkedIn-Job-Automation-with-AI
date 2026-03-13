@@ -286,6 +286,11 @@ async def start_automation_v2(
     work_authorization_us: str = Form("Yes"),
     require_sponsorship: str = Form("No"),
     willing_to_relocate: str = Form("Yes"),
+    ai_provider: str = Form("none"),
+    use_ai: str = Form("false"),
+    gemini_api_key: str = Form(""),
+    groq_api_key: str = Form(""),
+    openai_api_key: str = Form(""),
     dry_run: str = Form("false"),  # CHANGED: Default to false (actually submit)
     headless: str = Form("false"),
     resume: UploadFile = File(None)
@@ -322,6 +327,15 @@ async def start_automation_v2(
     current_title = _clean(current_title)
     years_experience = _clean(years_experience) or '0'
     skill_set = _clean(skill_set)
+    ai_provider = _clean(ai_provider).lower() or 'none'
+    gemini_api_key = _clean(gemini_api_key)
+    groq_api_key = _clean(groq_api_key)
+    openai_api_key = _clean(openai_api_key)
+    use_ai_flag = use_ai.lower() == "true"
+    has_any_ai_key = bool(gemini_api_key or groq_api_key or openai_api_key)
+    if ai_provider not in ("gemini", "groq", "openai"):
+        ai_provider = "none"
+    effective_use_ai = use_ai_flag and has_any_ai_key and ai_provider != "none"
     
     # Use phone_number if phone is empty (frontend sends phone_number)
     actual_phone = phone or phone_number
@@ -332,7 +346,8 @@ async def start_automation_v2(
     print(f"[AUTOMATION V2] City: '{city}', State: '{state}', Zip: '{zip_code}', Country: '{country}'")
     print(f"[AUTOMATION V2] Address: '{address}', LinkedIn: '{linkedin_url}'")
     print(f"[AUTOMATION V2] Current Title: '{current_title}', Company: '{current_company}'")
-    print(f"[AUTOMATION V2] Location: '{job_location}', Years Exp: '{years_experience}', Skills: '{skill_set}'")  
+    print(f"[AUTOMATION V2] Location: '{job_location}', Years Exp: '{years_experience}', Skills: '{skill_set}'")
+    print(f"[AUTOMATION V2] AI mode: use_ai={effective_use_ai}, provider={ai_provider}")
     
     resume_path = None
     if resume:
@@ -410,6 +425,13 @@ async def start_automation_v2(
         "resume_path": resume_path,
         "user_profile": user_profile,
         "resume_text": resume_data.get('raw_text', ''),
+        "ai_config": {
+            "use_ai": effective_use_ai,
+            "provider": ai_provider,
+            "gemini_api_key": gemini_api_key,
+            "groq_api_key": groq_api_key,
+            "openai_api_key": openai_api_key,
+        },
     }
     
     active_tasks[session_id]["config"] = config
@@ -465,6 +487,17 @@ async def run_playwright_subprocess(session_id: str, config: dict):
             import os as _os
             subprocess_env = _os.environ.copy()
             subprocess_env["PYTHONIOENCODING"] = "utf-8"
+            ai_cfg = config.get("ai_config", {})
+            if ai_cfg.get("use_ai"):
+                subprocess_env["AI_PROVIDER"] = str(ai_cfg.get("provider", "none"))
+                if ai_cfg.get("gemini_api_key"):
+                    subprocess_env["GEMINI_API_KEY"] = str(ai_cfg.get("gemini_api_key"))
+                    subprocess_env["GOOGLE_API_KEY"] = str(ai_cfg.get("gemini_api_key"))
+                if ai_cfg.get("groq_api_key"):
+                    subprocess_env["GROQ_API_KEY"] = str(ai_cfg.get("groq_api_key"))
+                    subprocess_env["groq_api_key"] = str(ai_cfg.get("groq_api_key"))
+                if ai_cfg.get("openai_api_key"):
+                    subprocess_env["OPENAI_API_KEY"] = str(ai_cfg.get("openai_api_key"))
             
             # Use subprocess.Popen with threading instead of asyncio
             process = subprocess.Popen(

@@ -181,6 +181,23 @@ export default function LinkedInAutomation() {
       apiFormData.append('require_sponsorship', formData.requireSponsorship);
       apiFormData.append('willing_to_relocate', formData.willingToRelocate);
 
+      // Optional AI mode: pass user-provided API keys (if saved in ApiKeySettings)
+      const geminiKey = (localStorage.getItem('GEMINI_API_KEY') || '').trim();
+      const groqKey = (localStorage.getItem('GROQ_API_KEY') || '').trim();
+      const openaiKey = (localStorage.getItem('OPENAI_API_KEY') || '').trim();
+      if (geminiKey) {
+        apiFormData.append('gemini_api_key', geminiKey);
+      }
+      if (groqKey) {
+        apiFormData.append('groq_api_key', groqKey);
+      }
+      if (openaiKey) {
+        apiFormData.append('openai_api_key', openaiKey);
+      }
+      const aiProvider = geminiKey ? 'gemini' : (groqKey ? 'groq' : (openaiKey ? 'openai' : 'none'));
+      apiFormData.append('ai_provider', aiProvider);
+      apiFormData.append('use_ai', aiProvider === 'none' ? 'false' : 'true');
+
       // Debug: log all form data being sent
       console.log('[AUTOMATION] Form data being sent:');
       for (const [key, value] of apiFormData.entries()) {
