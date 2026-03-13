@@ -69,12 +69,13 @@ class ResumeParser:
     
     def _extract_from_pdf(self, file_path: str) -> str:
         """Extract text from PDF file."""
-        if not PDF_AVAILABLE:
+        if not PDF_AVAILABLE or _PdfReader is None:
             return "PDF parsing not available - pypdf not installed"
         
         try:
             text = []
             with open(file_path, 'rb') as file:
+                # Narrow optional import for static type checking.
                 pdf_reader = _PdfReader(file)
                 for page in pdf_reader.pages:
                     page_text = page.extract_text()
