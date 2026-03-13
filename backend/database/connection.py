@@ -74,11 +74,9 @@ def _resolve_engine():
     for url in candidates:
         try:
             eng = _make_engine(url)
-            # Quick liveness check (1 s timeout for remote, instant for SQLite)
-            with eng.connect() as conn:
-                conn.execute(text("SELECT 1"))
+            # Skip the blocking liveness check at import time to prevent deployment hang
             display = url.split('@')[-1] if '@' in url else url
-            print("[DB] Connected: " + display)
+            print("[DB] Configured for: " + display)
             return eng, url
         except Exception as exc:
             display = url.split('@')[-1] if '@' in url else url
