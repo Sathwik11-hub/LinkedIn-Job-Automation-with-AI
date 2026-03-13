@@ -186,7 +186,7 @@ except Exception as e:
         DEBUG=os.environ.get("DEBUG", "True") in ["True", "true", "1"],
         LOG_LEVEL=os.environ.get("LOG_LEVEL", "INFO"),
         API_HOST=os.environ.get("API_HOST", "0.0.0.0"),
-        API_PORT=int(os.environ.get("API_PORT", "8000")),
+        API_PORT=int(os.environ.get("PORT", os.environ.get("API_PORT", "8000"))),
         API_RELOAD=False,
         SECRET_KEY=_secret_key,
         DATABASE_URL=os.environ.get("DATABASE_URL", "sqlite:///./data/autoagenthire.db"),
