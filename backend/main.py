@@ -72,9 +72,15 @@ async def lifespan(app: FastAPI):
     print(f"📝 Environment: {settings.APP_ENV}")
     print(f"🔧 Debug mode: {settings.DEBUG}")
     
-    # Initialize database
-    init_db()
-    print("✓ Database initialized")
+    # Initialize database without blocking service startup indefinitely.
+    # Render needs the process to bind quickly; DB issues should not prevent boot.
+    try:
+        await asyncio.wait_for(asyncio.to_thread(init_db), timeout=25)
+        print("✓ Database initialized")
+    except asyncio.TimeoutError:
+        print("[WARN] Database initialization timed out; continuing startup")
+    except Exception as e:
+        print(f"[WARN] Database initialization failed; continuing startup: {e}")
     
     # TODO: Initialize vector store
     # TODO: Start background scheduler

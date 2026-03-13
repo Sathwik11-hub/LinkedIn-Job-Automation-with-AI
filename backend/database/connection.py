@@ -51,6 +51,7 @@ def _make_engine(url: str):
         max_overflow=20,
         pool_pre_ping=True,
         echo=_echo,
+        connect_args={"connect_timeout": 10},
     )
 
 
