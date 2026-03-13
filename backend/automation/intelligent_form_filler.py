@@ -92,12 +92,21 @@ el => {
 class IntelligentFormFiller:
     """Fills LinkedIn Easy Apply forms with intelligent defaults."""
 
-    def __init__(self, page: Page, user_profile: Dict, resume_text: str = ""):
+    def __init__(self, page: Page, user_profile: Dict, resume_text: str = "",
+                 groq_api_key: str = "", gemini_api_key: str = ""):
         self.page = page
         self.user_profile = user_profile
         self.resume_text = resume_text
+        self.groq_api_key = groq_api_key
+        self.gemini_api_key = gemini_api_key
+        # AI fallback
+        self._ai_service = None
+        self.ai_cache: Dict[str, str] = {}
+        # Performance: field dedup cache — reset each fill_application_form() call
+        self.processed_fields: set = set()
         self._extract_resume_data()
         self._build_smart_defaults()
+        self._init_ai_service()
 
     # ------------------------------------------------------------------
     # Resume extraction
@@ -178,6 +187,27 @@ class IntelligentFormFiller:
                              'integrated.*api.*production', 'production system'],
                 'answer': 'Yes',
             },
+            'llm_provider_experience': {
+                'patterns': ['llm provider', 'openai, claude', 'claude, or gemini',
+                             'openai.*claude.*gemini', 'openai or gemini',
+                             'experience with.*llm', 'experience with at least one llm',
+                             'large language model'],
+                'answer': 'Yes',
+            },
+            'workflow_integration': {
+                'patterns': ['workflow/integration', 'workflow integration',
+                             'integration engineering', 'llm-based solution',
+                             'llm based solution', 'delivery of llm',
+                             'hands-on delivery'],
+                'answer': 'Yes',
+            },
+            'ai_experience': {
+                'patterns': ['ai experience', 'artificial intelligence',
+                             'machine learning experience', 'ml experience',
+                             'deep learning', 'ai/ml', 'ml/ai',
+                             'generative ai', 'genai'],
+                'answer': 'Yes',
+            },
             'structured_experiments': {
                 'patterns': ['structured experiment', 'run.*experiment',
                              'improve.*ai.*quality', 'ai output quality',
@@ -256,12 +286,94 @@ class IntelligentFormFiller:
             },
         }
 
+    # ------------------------------------------------------------------
+    # AI service initialisation
+    # ------------------------------------------------------------------
+    def _init_ai_service(self):
+        """Initialise AI service using provided API keys or environment variables."""
+        try:
+            from backend.llm.multi_ai_service import MultiAIService
+            if self.groq_api_key:
+                self._ai_service = MultiAIService(provider="groq", api_key=self.groq_api_key)
+                print("   [AI] Initialized Groq for form fallback")
+            elif self.gemini_api_key:
+                self._ai_service = MultiAIService(provider="gemini", api_key=self.gemini_api_key)
+                print("   [AI] Initialized Gemini for form fallback")
+            else:
+                # Auto-detect from environment
+                svc = MultiAIService()
+                self._ai_service = svc if svc.provider else None
+                if self._ai_service:
+                    print(f"   [AI] Auto-detected {svc.provider} for form fallback")
+        except Exception as e:
+            print(f"   [AI] AI service init failed (non-critical): {e}")
+            self._ai_service = None
+
+    # ------------------------------------------------------------------
+    # AI fallback — answer any unknown field label
+    # ------------------------------------------------------------------
+    async def _ai_answer_field(self, label: str, field_type: str = "text",
+                                options: Optional[List[str]] = None) -> Optional[str]:
+        """Use AI to answer an unknown form field. Results are cached per label+type."""
+        if not self._ai_service or not label.strip():
+            return None
+
+        cache_key = f"{label.strip().lower()}:{field_type}"
+        if cache_key in self.ai_cache:
+            return self.ai_cache[cache_key]
+
+        try:
+            resume_summary = (
+                self.resume_text[:1500] if self.resume_text
+                else str(self.user_profile)[:500]
+            )
+
+            if field_type == "numeric":
+                type_instruction = (
+                    "Return ONLY a single number (integer or decimal). "
+                    "Never return text like N/A, none, or any words."
+                )
+            elif field_type in ("radio", "dropdown") and options:
+                opts_str = ", ".join(options)
+                type_instruction = f"Return ONLY one of these exact options: {opts_str}"
+            else:
+                type_instruction = "Return a short professional answer in 1-10 words."
+
+            prompt = (
+                f"You are filling out a job application form.\n"
+                f"Question: {label}\n"
+                f"Applicant resume summary: {resume_summary}\n"
+                f"{type_instruction}\n"
+                f"Answer:"
+            )
+
+            loop = asyncio.get_event_loop()
+            _svc = self._ai_service  # local ref — already None-checked above
+            response = await loop.run_in_executor(
+                None, lambda: _svc.generate_text(prompt)  # type: ignore[union-attr]
+            )
+
+            if response:
+                answer = str(response).strip().strip('"').strip("'")
+                if field_type == "numeric":
+                    # Extract first numeric token; fall back to safe default
+                    first_token = answer.split()[0] if answer.split() else "1"
+                    cleaned = re.sub(r'[^\d.]', '', first_token)
+                    answer = cleaned if cleaned else "1"
+                self.ai_cache[cache_key] = answer
+                print(f'   [AI] Answered "{label[:40]}" ({field_type}) -> "{answer[:30]}"')
+                return answer
+        except Exception as e:
+            print(f'   [AI] Failed for "{label[:40]}": {e}')
+        return None
+
     # ==================================================================
     # PUBLIC — fill entire visible page
     # ==================================================================
     async def fill_application_form(self) -> Dict:
         filled = 0
         errors: List[str] = []
+        self.processed_fields = set()  # reset per-page field cache
         try:
             filled += await self._fill_text_inputs()
             filled += await self._fill_textareas()
@@ -291,6 +403,110 @@ class IntelligentFormFiller:
             print(f"   [VALIDATE] Error during sweep: {e}")
         if fixed:
             print(f"   [VALIDATE] Fixed {fixed} invalid/empty required fields")
+        return fixed
+
+    # ==================================================================
+    # PUBLIC — detect "Please enter a valid answer" and re-process
+    # ==================================================================
+    async def scan_and_fix_validation_errors(self) -> int:
+        """Detect visible validation error spans (\"Please enter a valid answer\",
+        \"This field is required\", etc.) and re-process the associated dropdown
+        / input fields.  Returns number of fixes.
+
+        Step 6 from user spec: scan for
+            span:has-text(\"Please enter a valid answer\")
+        and re-fill the neighbouring form element.
+        """
+        fixed = 0
+        try:
+            # Find all visible error messages
+            error_els = await self.page.query_selector_all(
+                '.artdeco-inline-feedback--error, '
+                '[data-test-form-element-error], '
+                '.fb-dash-form-element__error-field'
+            )
+            for err_el in error_els:
+                try:
+                    if not await err_el.is_visible():
+                        continue
+                    # Walk up to the form-element container
+                    container = await err_el.evaluate_handle("""
+                        el => {
+                            let n = el.parentElement;
+                            for (let i = 0; i < 8 && n; i++) {
+                                if (n.classList.contains('fb-dash-form-element') ||
+                                    n.hasAttribute('data-test-form-builder-select-container')) {
+                                    return n;
+                                }
+                                n = n.parentElement;
+                            }
+                            return null;
+                        }
+                    """)
+                    if not container or await container.evaluate('el => el === null'):
+                        continue
+                    container_el = container.as_element()
+                    if not container_el:
+                        continue
+
+                    # Try to fix a dropdown inside this container
+                    trigger = None
+                    for sel in ['[role="combobox"]', '[aria-haspopup="listbox"]',
+                                'select', 'button[aria-haspopup]']:
+                        trigger = await container_el.query_selector(sel)
+                        if trigger and await trigger.is_visible():
+                            break
+                        trigger = None
+
+                    if trigger:
+                        cur_text = await self._get_trigger_display_text(trigger)
+                        if cur_text.lower() in PLACEHOLDER_TEXTS:
+                            label = await self._get_container_label(container_el)
+                            tag = (await trigger.evaluate('el => el.tagName')).lower()
+                            if tag == 'select':
+                                opts = await self._collect_select_options(trigger)
+                                if opts:
+                                    ot = [t for t, _ in opts]
+                                    ov = [v for _, v in opts]
+                                    chosen = self._pick_dropdown_answer(label, ot, ov)
+                                    if chosen and await self._set_native_select(trigger, chosen, ot, ov):
+                                        fixed += 1
+                            else:
+                                if await self._open_and_select_react_dropdown(trigger, label):
+                                    fixed += 1
+                            continue
+
+                    # Try to fix an input inside this container
+                    inp = await container_el.query_selector(
+                        'input[type="text"], input[type="number"], input:not([type]), textarea'
+                    )
+                    if inp and await inp.is_visible():
+                        cur = (await inp.input_value()).strip()
+                        if not cur:
+                            label = await self._label(inp)
+                            inp_type = (await inp.get_attribute('type') or 'text').lower()
+                            is_num = inp_type == 'number' or self._label_looks_numeric(label)
+                            if is_num:
+                                val = self.validate_field_value(label, self._resolve_numeric(label, ''), True) or '1'
+                            else:
+                                raw = self._resolve_text(label, '')
+                                val = self.validate_field_value(label, raw, False)
+                                if not val:
+                                    ai_ans = await self._ai_answer_field(label, 'text')
+                                    val = ai_ans
+                            if val:
+                                await inp.fill(val)
+                                await inp.evaluate(
+                                    'el => { el.dispatchEvent(new Event("input",{bubbles:true})); '
+                                    'el.dispatchEvent(new Event("change",{bubbles:true})); }'
+                                )
+                                fixed += 1
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"   [VALIDATE-ERR] Error scanning validation messages: {e}")
+        if fixed:
+            print(f"   [VALIDATE-ERR] Fixed {fixed} fields with validation errors")
         return fixed
 
     # ==================================================================
@@ -370,7 +586,19 @@ class IntelligentFormFiller:
     async def _fill_text_inputs(self) -> int:
         filled = 0
         try:
-            inputs = await self.page.query_selector_all(
+            # Scope queries to the active <form> container for speed;
+            # fall back to full page when no <form> is found.
+            root = self.page
+            try:
+                form_handle = await self.page.query_selector(
+                    "form, .jobs-easy-apply-modal__content, [data-test-modal]"
+                )
+                if form_handle and await form_handle.is_visible():
+                    root = form_handle  # type: ignore[assignment]
+            except Exception:
+                pass
+
+            inputs = await root.query_selector_all(
                 'input[type="text"], input[type="number"], input[type="tel"], '
                 'input:not([type])'
             )
@@ -378,7 +606,6 @@ class IntelligentFormFiller:
                 try:
                     if not await inp.is_visible():
                         continue
-                    cur = (await inp.input_value()).strip()
                     inp_type = (await inp.get_attribute('type') or 'text').lower()
                     inputmode = (await inp.get_attribute('inputmode') or '').lower()
                     label = await self._label(inp)
@@ -387,32 +614,48 @@ class IntelligentFormFiller:
                               or inputmode == 'numeric'
                               or self._label_looks_numeric(label + ' ' + placeholder))
 
-                    if cur:
-                        # Already has value — but validate numeric
-                        if is_num and self.validate_field_value('', cur, True) is None:
-                            pass  # invalid numeric like "N/A" — fall through to re-fill
-                        else:
-                            continue  # valid existing value
+                    # Skip already-processed fields (dedup cache)
+                    field_key = f"input:{label.strip().lower()}:{inp_type}"
+                    if field_key in self.processed_fields:
+                        continue
 
+                    cur = (await inp.input_value()).strip()
+                    if cur:
+                        # Valid existing value — mark and skip
+                        if is_num and self.validate_field_value('', cur, True) is None:
+                            pass  # invalid numeric (e.g. "N/A") — fall through to re-fill
+                        else:
+                            self.processed_fields.add(field_key)
+                            continue
+
+                    val: Optional[str] = None
                     if is_num:
                         raw = self._resolve_numeric(label, placeholder)
                         val = self.validate_field_value(label, raw, True)
+                        if val is None:
+                            # AI fallback for unknown numeric fields
+                            ai_ans = await self._ai_answer_field(label, "numeric")
+                            val = self.validate_field_value(label, ai_ans, True) if ai_ans else None
                         if val is None:
                             val = '1'  # safe numeric fallback — never "N/A"
                     else:
                         raw = self._resolve_text(label, placeholder)
                         val = self.validate_field_value(label, raw, False)
+                        if val is None:
+                            # AI fallback for unknown text fields
+                            ai_ans = await self._ai_answer_field(label, "text")
+                            val = self.validate_field_value(label, ai_ans, False) if ai_ans else None
 
                     if val:
                         await inp.fill('')
-                        await asyncio.sleep(0.05)
                         await inp.fill(val)
                         await inp.evaluate(
                             'el => { el.dispatchEvent(new Event("input",{bubbles:true})); '
                             'el.dispatchEvent(new Event("change",{bubbles:true})); }'
                         )
-                        await asyncio.sleep(random.uniform(0.2, 0.5))
+                        await asyncio.sleep(0.1)
                         filled += 1
+                        self.processed_fields.add(field_key)
                         print(f'   [FORM] Input: "{label[:40]}" = "{val[:20]}"')
                 except Exception as e:
                     print(f'   [FORM] Input err: {str(e)[:60]}')
@@ -430,15 +673,23 @@ class IntelligentFormFiller:
                 try:
                     if not await ta.is_visible():
                         continue
+                    label = await self._label(ta)
+                    field_key = f"textarea:{label.strip().lower()}"
+                    if field_key in self.processed_fields:
+                        continue
                     cur = (await ta.input_value()).strip()
                     if len(cur) > 20:
+                        self.processed_fields.add(field_key)
                         continue
-                    label = await self._label(ta)
                     val = self._resolve_text(label, '')
+                    if val is None:
+                        ai_ans = await self._ai_answer_field(label, "text")
+                        val = ai_ans if ai_ans else None
                     if val:
                         await ta.fill(val)
-                        await asyncio.sleep(random.uniform(0.3, 0.7))
+                        await asyncio.sleep(0.15)
                         filled += 1
+                        self.processed_fields.add(field_key)
                         print(f'   [FORM] Textarea: "{label[:40]}"')
                 except Exception:
                     continue
@@ -456,14 +707,18 @@ class IntelligentFormFiller:
                 try:
                     if not await sel.is_visible():
                         continue
+                    label = await self._label(sel)
+                    field_key = f"select:{label.strip().lower()}"
+                    if field_key in self.processed_fields:
+                        continue
                     cur_text = await sel.evaluate(
                         'el => el.options[el.selectedIndex]'
                         ' ? el.options[el.selectedIndex].text.trim() : ""'
                     )
                     if cur_text.lower() not in PLACEHOLDER_TEXTS:
+                        self.processed_fields.add(field_key)
                         continue  # already answered
 
-                    label = await self._label(sel)
                     opts = await self._collect_select_options(sel)
                     if not opts:
                         continue
@@ -472,10 +727,21 @@ class IntelligentFormFiller:
 
                     chosen = self._pick_dropdown_answer(label, opt_texts, opt_values)
                     if not chosen:
+                        # AI fallback for native select
+                        ai_ans = await self._ai_answer_field(label, "dropdown", opt_texts)
+                        if ai_ans:
+                            for i, t in enumerate(opt_texts):
+                                if ai_ans.lower() in t.lower() or t.lower() in ai_ans.lower():
+                                    chosen = opt_values[i]
+                                    break
+                            if not chosen and opt_values:
+                                chosen = opt_values[0]
+                    if not chosen:
                         continue
 
                     if await self._set_native_select(sel, chosen, opt_texts, opt_values):
                         filled += 1
+                        self.processed_fields.add(field_key)
                         print(f'   [FORM] Select: "{label[:40]}" -> "{chosen[:20]}"')
                 except Exception as e:
                     print(f'   [FORM] Select err: {str(e)[:60]}')
@@ -617,25 +883,188 @@ class IntelligentFormFiller:
     async def _fill_custom_dropdowns(self) -> int:
         """Robust LinkedIn React dropdown handler.
 
-        Detection:
-          1. Scan all .fb-dash-form-element containers for unselected dropdowns.
-          2. Scan standalone [aria-haspopup="listbox"] / [role="combobox"] triggers.
+        Detection (3 passes, in order):
+          0. Locator-based — page.locator('[role="combobox"]') and
+             page.locator('button[aria-haspopup="listbox"]')
+          1. Container-based — .fb-dash-form-element wrappers
+          2. Standalone ARIA triggers
 
-        Opening strategies (tried in order per dropdown):
-          A. Click the trigger element directly.
-          B. Click the container's <select>-like element and wait for listbox.
-          C. Focus + ArrowDown to force-open.
-
-        Selection:
-          - Match smart_defaults / YES_NO heuristic / first-option fallback.
-          - Verify selection stuck; retry once if still placeholder.
+        Each pass scrolls into view, clicks, waits, selects, and verifies.
         """
         filled = 0
         try:
+            filled += await self._fill_dropdowns_via_locator()
             filled += await self._fill_dropdowns_via_containers()
             filled += await self._fill_dropdowns_via_aria_triggers()
         except Exception as e:
             print(f'   [FORM] Custom dropdown err: {e}')
+        return filled
+
+    # ------------------------------------------------------------------
+    #  Strategy 0: Locator-based React dropdown handler (most reliable)
+    # ------------------------------------------------------------------
+    async def _fill_dropdowns_via_locator(self) -> int:
+        """Use Playwright locators to find and fill React dropdowns.
+
+        Targets:
+          div[role="combobox"]
+          button[aria-haspopup="listbox"]
+
+        Follows the exact 5-step sequence:
+          scroll_into_view → click → wait_for_selector → get_by_role → verify.
+        """
+        filled = 0
+        page = self.page
+
+        selectors = [
+            '[role="combobox"]',
+            'button[aria-haspopup="listbox"]',
+        ]
+
+        for selector in selectors:
+            try:
+                elements = await page.query_selector_all(selector)
+                for el in elements:
+                    try:
+                        if not await el.is_visible():
+                            continue
+
+                        cur_text = await self._get_trigger_display_text(el)
+                        if cur_text.lower() not in PLACEHOLDER_TEXTS:
+                            continue  # already answered
+
+                        label = await self._label(el)
+                        field_key = f"dropdown:{label.strip().lower()}"
+                        if field_key in self.processed_fields:
+                            continue
+
+                        # STEP 1 — Scroll into view
+                        await el.scroll_into_view_if_needed()
+                        await asyncio.sleep(0.05)
+
+                        # STEP 2 — Click to open
+                        await el.click()
+
+                        # STEP 3 — Wait for options
+                        try:
+                            await page.wait_for_selector(
+                                '[role="option"]', state="visible", timeout=2500
+                            )
+                        except Exception:
+                            # retry with Focus + ArrowDown
+                            await el.focus()
+                            await page.keyboard.press('ArrowDown')
+                            try:
+                                await page.wait_for_selector(
+                                    '[role="option"]', state="visible", timeout=2000
+                                )
+                            except Exception:
+                                await self._close_dropdown()
+                                continue
+
+                        # Collect visible options
+                        option_els = await self._collect_visible_options()
+                        if not option_els:
+                            await self._close_dropdown()
+                            continue
+
+                        opt_map: List[Tuple[str, ElementHandle]] = []
+                        for oel in option_els:
+                            try:
+                                t = (await oel.inner_text()).strip()
+                                if t and t.lower() not in PLACEHOLDER_TEXTS:
+                                    opt_map.append((t, oel))
+                            except Exception:
+                                continue
+
+                        if not opt_map:
+                            await self._close_dropdown()
+                            continue
+
+                        opt_texts = [t for t, _ in opt_map]
+
+                        # STEP 4 — Pick best option
+                        desired = self._pick_dropdown_answer(label, opt_texts, opt_texts)
+                        if not desired:
+                            ai_ans = await self._ai_answer_field(label, "dropdown", opt_texts)
+                            if ai_ans:
+                                desired = ai_ans
+
+                        chosen_el = None
+                        chosen_text = ""
+                        if desired:
+                            dl = desired.lower()
+                            for t, oel in opt_map:
+                                if t.lower() == dl:
+                                    chosen_el = oel; chosen_text = t; break
+                            if not chosen_el:
+                                for t, oel in opt_map:
+                                    if dl in t.lower() or t.lower() in dl:
+                                        chosen_el = oel; chosen_text = t; break
+
+                        # Fallback: prefer "Yes"
+                        if not chosen_el:
+                            for t, oel in opt_map:
+                                if t.lower() in ('yes', 'y'):
+                                    chosen_el = oel; chosen_text = t; break
+                        if not chosen_el:
+                            idx = 1 if len(opt_map) > 1 else 0
+                            chosen_el = opt_map[idx][1]
+                            chosen_text = opt_map[idx][0]
+
+                        # Click option
+                        try:
+                            await chosen_el.scroll_into_view_if_needed()
+                            await chosen_el.click()
+                        except Exception:
+                            try:
+                                await chosen_el.evaluate('el => el.click()')
+                            except Exception:
+                                await self._close_dropdown()
+                                continue
+
+                        await asyncio.sleep(0.2)
+
+                        # STEP 5 — Verify selection stuck
+                        verify = await self._get_trigger_display_text(el)
+                        if verify.lower() in PLACEHOLDER_TEXTS:
+                            # Retry once
+                            await el.scroll_into_view_if_needed()
+                            await el.click()
+                            try:
+                                await page.wait_for_selector(
+                                    '[role="option"]', state="visible", timeout=2000
+                                )
+                            except Exception:
+                                pass
+                            option_els2 = await self._collect_visible_options()
+                            for oel2 in option_els2:
+                                try:
+                                    t2 = (await oel2.inner_text()).strip()
+                                    if t2.lower() == chosen_text.lower():
+                                        await oel2.click()
+                                        await asyncio.sleep(0.2)
+                                        break
+                                except Exception:
+                                    continue
+                            verify2 = await self._get_trigger_display_text(el)
+                            if verify2.lower() in PLACEHOLDER_TEXTS:
+                                print(f'   [FORM] Locator dropdown "{label[:40]}" — STILL placeholder after retry')
+                                continue
+
+                        filled += 1
+                        self.processed_fields.add(field_key)
+                        print(f'   [FORM] LocatorDD: "{label[:40]}" -> "{chosen_text[:30]}"')
+
+                    except Exception as e:
+                        print(f'   [FORM] Locator dropdown err: {str(e)[:80]}')
+                        try:
+                            await page.keyboard.press('Escape')
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
         return filled
 
     async def _fill_dropdowns_via_containers(self) -> int:
@@ -650,9 +1079,14 @@ class IntelligentFormFiller:
                 try:
                     if not await container.is_visible():
                         continue
+                    label = await self._get_container_label(container)
+                    field_key = f"dropdown:{label.strip().lower()}"
+                    if field_key in self.processed_fields:
+                        continue
                     result = await self._handle_single_dropdown_container(container)
                     if result:
                         filled += 1
+                        self.processed_fields.add(field_key)
                 except Exception as e:
                     print(f'   [FORM] Container dropdown err: {str(e)[:80]}')
                     try:
@@ -710,13 +1144,18 @@ class IntelligentFormFiller:
         return await self._open_and_select_react_dropdown(trigger, label)
 
     async def _fill_dropdowns_via_aria_triggers(self) -> int:
-        """Strategy 2: Find standalone ARIA dropdown triggers not inside containers."""
+        """Strategy 2: Find standalone ARIA dropdown triggers not inside containers.
+
+        Detects:  div[role="combobox"]  |  button[aria-haspopup="listbox"]
+                  div:text("Select an option")  |  .artdeco-dropdown__trigger
+        """
         filled = 0
         try:
             triggers = await self.page.query_selector_all(
                 '[aria-haspopup="listbox"], '
                 '[role="combobox"], '
                 'button[aria-haspopup="listbox"], '
+                'div[role="combobox"], '
                 '.artdeco-dropdown__trigger'
             )
             for trigger in triggers:
@@ -737,8 +1176,13 @@ class IntelligentFormFiller:
                         continue
 
                     label = await self._label(trigger)
+                    field_key = f"dropdown:{label.strip().lower()}"
+                    if field_key in self.processed_fields:
+                        continue
+
                     if await self._open_and_select_react_dropdown(trigger, label):
                         filled += 1
+                        self.processed_fields.add(field_key)
                 except Exception:
                     try:
                         await self.page.keyboard.press('Escape')
@@ -792,14 +1236,22 @@ class IntelligentFormFiller:
         self, trigger: ElementHandle, label: str
     ) -> bool:
         """Open a React/ARIA dropdown, select the best option, verify it stuck.
-        Returns True on success."""
+        Returns True on success.
+
+        Selection priority (Problem 2):
+          1. smart_defaults match
+          2. Keyword-based Yes/No for: relocate / authorized / willing / experience
+          3. AI fallback when api_key is provided
+          4. Prefer "Yes" option
+          5. First valid option
+        """
 
         for attempt in range(2):  # retry once if selection doesn't stick
             option_els = await self._open_dropdown(trigger)
             if not option_els:
                 if attempt == 0:
                     print(f'   [FORM] Dropdown "{label[:40]}" — could not open, retrying...')
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.4)
                     continue
                 print(f'   [FORM] Dropdown "{label[:40]}" — failed to open after retry')
                 return False
@@ -822,47 +1274,46 @@ class IntelligentFormFiller:
             opt_texts = [t for t, _ in opt_map]
             desired = self._pick_dropdown_answer(label, opt_texts, opt_texts)
 
+            # AI fallback when smart_defaults gave no answer
+            if not desired and attempt == 0:
+                ai_ans = await self._ai_answer_field(label, "dropdown", opt_texts)
+                if ai_ans:
+                    desired = ai_ans
+
             # Find the best matching option element
             chosen_el = None
             chosen_text = ""
             if desired:
                 dl = desired.lower()
-                # Exact match first
                 for t, el in opt_map:
                     if t.lower() == dl:
-                        chosen_el = el
-                        chosen_text = t
-                        break
-                # Partial match
+                        chosen_el = el; chosen_text = t; break
                 if not chosen_el:
                     for t, el in opt_map:
                         if dl in t.lower() or t.lower() in dl:
-                            chosen_el = el
-                            chosen_text = t
-                            break
+                            chosen_el = el; chosen_text = t; break
 
-            # Fallback: prefer "Yes", then first real option
+            # Fallback: prefer "Yes", then index 1 (skip first placeholder if any), then [0]
             if not chosen_el:
                 for t, el in opt_map:
                     if t.lower() in ('yes', 'y'):
-                        chosen_el = el
-                        chosen_text = t
-                        break
-                if not chosen_el:
-                    chosen_el = opt_map[0][1]
-                    chosen_text = opt_map[0][0]
+                        chosen_el = el; chosen_text = t; break
+            if not chosen_el:
+                # Use index 1 if available (index 0 may be a secondary placeholder)
+                chosen_idx = 1 if len(opt_map) > 1 else 0
+                chosen_el = opt_map[chosen_idx][1]
+                chosen_text = opt_map[chosen_idx][0]
 
             # Click the option
             try:
                 await chosen_el.scroll_into_view_if_needed()
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
                 await chosen_el.click()
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(0.25)
             except Exception:
-                # Fallback: click via JS
                 try:
                     await chosen_el.evaluate('el => el.click()')
-                    await asyncio.sleep(0.4)
+                    await asyncio.sleep(0.25)
                 except Exception:
                     await self._close_dropdown()
                     continue
@@ -887,16 +1338,22 @@ class IntelligentFormFiller:
         """Try multiple strategies to open a dropdown and return option elements.
 
         Strategies:
-          1. Direct click on trigger → wait for [role="option"]
-          2. Focus + ArrowDown → wait for [role="option"]
-          3. Click trigger + look for visible <div> options with data-test attrs
+          1. scroll_into_view + direct click → wait_for_selector('[role="option"]')
+          2. Focus + ArrowDown → wait_for_selector('[role="option"]')
+          3. Click again + longer wait_for_selector
+          4. JS mousedown+click events → wait_for_selector
         """
         page = self.page
 
-        # -- Strategy 1: Direct click --
+        # -- Strategy 1: Scroll into view + direct click --
         try:
+            await trigger.scroll_into_view_if_needed()
+            await asyncio.sleep(0.05)
             await trigger.click()
-            await asyncio.sleep(0.5)
+            try:
+                await page.wait_for_selector('[role="option"]', state="visible", timeout=2000)
+            except Exception:
+                pass
             options = await self._collect_visible_options()
             if options:
                 return options
@@ -906,9 +1363,12 @@ class IntelligentFormFiller:
         # -- Strategy 2: Focus + ArrowDown --
         try:
             await trigger.focus()
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.1)
             await page.keyboard.press('ArrowDown')
-            await asyncio.sleep(0.5)
+            try:
+                await page.wait_for_selector('[role="option"]', state="visible", timeout=2000)
+            except Exception:
+                pass
             options = await self._collect_visible_options()
             if options:
                 return options
@@ -917,8 +1377,12 @@ class IntelligentFormFiller:
 
         # -- Strategy 3: Click again + longer wait --
         try:
+            await trigger.scroll_into_view_if_needed()
             await trigger.click()
-            await asyncio.sleep(1.0)
+            try:
+                await page.wait_for_selector('[role="option"]', state="visible", timeout=3000)
+            except Exception:
+                await asyncio.sleep(0.8)
             options = await self._collect_visible_options()
             if options:
                 return options
@@ -934,7 +1398,10 @@ class IntelligentFormFiller:
                     el.dispatchEvent(new MouseEvent('click',     {bubbles: true}));
                 }
             """)
-            await asyncio.sleep(0.7)
+            try:
+                await page.wait_for_selector('[role="option"]', state="visible", timeout=2000)
+            except Exception:
+                await asyncio.sleep(0.5)
             options = await self._collect_visible_options()
             if options:
                 return options
@@ -1019,6 +1486,10 @@ class IntelligentFormFiller:
                     if any([await r.is_checked() for r in group]):
                         continue
                     label = await self._label(group[0])
+                    field_key = f"radio:{label.strip().lower()}"
+                    if field_key in self.processed_fields:
+                        continue
+
                     opts: List[str] = []
                     for r in group:
                         rid = await r.get_attribute('id')
@@ -1032,8 +1503,19 @@ class IntelligentFormFiller:
                         opts.append(rl)
 
                     idx = self._pick_radio_answer(label, opts)
+                    if idx is None and self._ai_service:
+                        # AI fallback for radio buttons
+                        ai_ans = await self._ai_answer_field(label, "radio", opts)
+                        if ai_ans:
+                            al = ai_ans.lower()
+                            for i, o in enumerate(opts):
+                                if al in o.lower() or o.lower() in al:
+                                    idx = i
+                                    break
+                            if idx is None:
+                                idx = 0
+
                     if idx is not None and idx < len(group):
-                        # Click the label element if available (more reliable in LinkedIn)
                         rid = await group[idx].get_attribute('id')
                         clicked = False
                         if rid:
@@ -1043,8 +1525,9 @@ class IntelligentFormFiller:
                                 clicked = True
                         if not clicked:
                             await group[idx].click()
-                        await asyncio.sleep(random.uniform(0.2, 0.5))
+                        await asyncio.sleep(0.15)
                         filled += 1
+                        self.processed_fields.add(field_key)
                         print(f'   [FORM] Radio: "{label[:40]}" -> "{opts[idx][:20]}"')
                 except Exception:
                     continue
@@ -1322,7 +1805,14 @@ class IntelligentFormFiller:
     # ------------------------------------------------------------------
     def _pick_dropdown_answer(self, label: str, opt_texts: List[str],
                               opt_values: List[str]) -> Optional[str]:
-        """Pick the best dropdown option value given label + available options."""
+        """Pick the best dropdown option value given label + available options.
+
+        Priority:
+          1. smart_defaults patterns
+          2. Explicit Yes-forcing keywords (relocate / authorized / willing / experience)
+          3. General Yes/No heuristic
+          4. First real option fallback
+        """
         ll = label.lower()
 
         # 1. Match smart defaults
@@ -1334,13 +1824,22 @@ class IntelligentFormFiller:
                     if tl == ans or ans in tl or tl in ans:
                         return opt_values[i]
 
-        # 2. Yes/No heuristic for question-like labels
+        # 2. Explicit Yes-forcing keywords (Problem 2 requirement)
+        YES_FORCE_KEYWORDS = ['relocate', 'authorized', 'authorised', 'willing',
+                              'experience', 'open to', 'work authorization',
+                              'llm provider', 'llm', 'ai', 'workflow', 'integration']
+        if any(kw in ll for kw in YES_FORCE_KEYWORDS):
+            for i, t in enumerate(opt_texts):
+                if t.lower() in ('yes', 'y'):
+                    return opt_values[i]
+
+        # 3. Yes/No heuristic for question-like labels
         if any(cue in ll for cue in YES_NO_QUESTION_CUES):
             for i, t in enumerate(opt_texts):
                 if t.lower() in ('yes', 'y'):
                     return opt_values[i]
 
-        # 3. Fallback — first real option (never placeholder)
+        # 4. Fallback — first real option (never placeholder)
         return opt_values[0] if opt_values else None
 
     def _pick_radio_answer(self, label: str, option_labels: List[str]) -> Optional[int]:

@@ -50,8 +50,11 @@ def init_db_sync():
     print("🔧 Initializing database (sync)...")
     
     # Create sync engine
+    sync_url = settings.SYNC_DATABASE_URL
+    if not sync_url:
+        raise ValueError("SYNC_DATABASE_URL is not configured")
     engine = create_engine(
-        settings.SYNC_DATABASE_URL,
+        sync_url,
         echo=True
     )
     

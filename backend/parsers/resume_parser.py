@@ -13,6 +13,7 @@ try:
     from pypdf import PdfReader as _PdfReader
     PDF_AVAILABLE = True
 except ImportError:
+    _PdfReader = None  # type: ignore[assignment]
     PDF_AVAILABLE = False
     logger.warning("pypdf not installed - PDF parsing disabled")
 

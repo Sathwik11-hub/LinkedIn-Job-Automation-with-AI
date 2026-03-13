@@ -843,7 +843,9 @@ class LinkedInAutoApply:
                 'gender': os.getenv('GENDER', 'Male'),
                 'skill_experience': skill_experience,
             }
-            form_filler = IntelligentFormFiller(self.page, user_profile=user_profile, resume_text=self.resume_text)
+            form_filler = IntelligentFormFiller(self.page, user_profile=user_profile, resume_text=self.resume_text,
+                                                groq_api_key=os.getenv('GROQ_API_KEY', ''),
+                                                gemini_api_key=os.getenv('GEMINI_API_KEY', '') or os.getenv('GOOGLE_API_KEY', ''))
             await form_filler.fill_application_form()
 
             # Advance through Easy Apply stages (Next/Review/Submit)
@@ -928,7 +930,9 @@ class LinkedInAutoApply:
 
         def _make_filler():
             return IntelligentFormFiller(page, user_profile=user_profile,
-                                        resume_text=self.resume_text)
+                                        resume_text=self.resume_text,
+                                        groq_api_key=os.getenv('GROQ_API_KEY', ''),
+                                        gemini_api_key=os.getenv('GEMINI_API_KEY', '') or os.getenv('GOOGLE_API_KEY', ''))
 
         for step in range(max_steps):
             # Security challenge guard
@@ -976,6 +980,7 @@ class LinkedInAutoApply:
                 filler_post = _make_filler()
                 if await filler_post.has_visible_errors():
                     logger.info("[APPLY] Errors detected after Next — re-filling dropdowns & retrying...")
+                    await filler_post.scan_and_fix_validation_errors()
                     await filler_post.fill_application_form()
                     await filler_post.validate_and_fix()
                     await self.human_delay(0.5, 1)
@@ -985,8 +990,10 @@ class LinkedInAutoApply:
                         logger.warning("[APPLY] Errors persist after re-fill — doing aggressive dropdown sweep")
                         # Aggressive: run dropdown handlers one more time
                         filler_retry = _make_filler()
+                        await filler_retry._fill_dropdowns_via_locator()
                         await filler_retry._fill_custom_dropdowns()
                         await filler_retry._fix_remaining_select_an_option()
+                        await filler_retry.scan_and_fix_validation_errors()
                         await filler_retry.validate_and_fix()
                         await self.human_delay(0.3, 0.5)
 
