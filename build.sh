@@ -14,8 +14,9 @@ else
     pip install -r requirements.txt
 fi
 
-echo "Installing Playwright system dependencies (Chromium OS libs)..."
-playwright install-deps chromium
+# Render does not allow root/sudo access, so we cannot run install-deps.
+# Render's native environments usually already contain the required shared libraries for Chromium.
+# playwright install-deps chromium
 
 echo "Installing Playwright browsers..."
 playwright install chromium
