@@ -1,25 +1,45 @@
 import { motion } from "framer-motion";
 import { useState, useEffect } from "react";
 import {
-  Send, Eye, Calendar, Clock, TrendingUp, TrendingDown, 
-  Play, Pause, FileText, Search, MoreVertical, ExternalLink, ArrowUpRight, Activity
+  Send, Eye, TrendingUp, TrendingDown,
+  Pause, FileText, Search, Activity
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Link, useNavigate } from "react-router-dom";
 import { useToast } from "@/hooks/use-toast";
+import { apiClient, API_ENDPOINTS } from "@/lib/api";
 
 const DashboardHome = () => {
   const { toast } = useToast();
   const navigate = useNavigate();
   const [agentStatus, setAgentStatus] = useState<any>(null);
   const [loading, setLoading] = useState(false);
+  const [userName, setUserName] = useState<string>("");
+
+  // Fetch logged-in user's name
+  useEffect(() => {
+    const fetchUser = async () => {
+      try {
+        const response = await apiClient.get(API_ENDPOINTS.auth.me);
+        const user = response.data;
+        if (user.full_name && user.full_name.trim()) {
+          setUserName(user.full_name.split(" ")[0]);
+        } else if (user.email) {
+          setUserName(user.email.split("@")[0]);
+        }
+      } catch (error) {
+        console.error("Failed to fetch user profile:", error);
+      }
+    };
+    fetchUser();
+  }, []);
 
   // Fetch agent status
   useEffect(() => {
     const fetchStatus = async () => {
       try {
-        const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+        const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
         const response = await fetch(`${API_BASE_URL}/api/agent/status`);
         const data = await response.json();
         setAgentStatus(data.detail);
@@ -29,8 +49,7 @@ const DashboardHome = () => {
     };
 
     fetchStatus();
-    const interval = setInterval(fetchStatus, 5000); // Poll every 5 seconds
-
+    const interval = setInterval(fetchStatus, 5000);
     return () => clearInterval(interval);
   }, []);
 
@@ -83,7 +102,9 @@ const DashboardHome = () => {
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.5 }}
       >
-        <h1 className="text-3xl font-bold mb-2">Welcome back! 👋</h1>
+        <h1 className="text-3xl font-bold mb-2">
+          Welcome back{userName ? `, ${userName}` : ""}! 👋
+        </h1>
         <p className="text-muted-foreground">
           {agentStatus?.status === "running" 
             ? "Your AI agent is actively searching for jobs and applying on LinkedIn..." 

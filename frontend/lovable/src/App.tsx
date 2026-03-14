@@ -10,7 +10,6 @@ import Login from "./pages/Login";
 import OnboardingIntegrated from "./pages/OnboardingIntegrated";
 import { DashboardLayout } from "./components/layout/DashboardLayout";
 import DashboardHome from "./pages/dashboard/DashboardHome";
-import JobSearch from "./pages/dashboard/JobSearch";
 import JobSearchConfig from "./pages/dashboard/JobSearchConfig";
 import Applications from "./pages/dashboard/Applications";
 import { ApiKeySettings } from "./components/ApiKeySettings";

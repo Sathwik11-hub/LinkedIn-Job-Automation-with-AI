@@ -64,7 +64,10 @@ const Login = () => {
       }
     },
     onError: (err: any) => {
-      const msg = err?.error_description || err?.error || "Google sign-in was cancelled or failed.";
+      const msg =
+        err?.error_description ||
+        err?.error ||
+        "Google sign-in was cancelled or failed.";
       setError(msg);
     },
   });
@@ -79,7 +82,6 @@ const Login = () => {
         email: formData.email,
         password: formData.password,
       });
-
       const { access_token } = response.data;
       localStorage.setItem("authToken", access_token);
       navigate("/dashboard");
@@ -101,7 +103,7 @@ const Login = () => {
         <div className="absolute inset-0 floating-particles opacity-30" />
         <div className="absolute top-1/3 right-1/4 w-72 h-72 bg-primary/20 rounded-full blur-[100px]" />
         <div className="absolute bottom-1/3 left-1/4 w-64 h-64 bg-blue-500/20 rounded-full blur-[100px]" />
-        
+
         <motion.div
           initial={{ opacity: 0, scale: 0.9 }}
           animate={{ opacity: 1, scale: 1 }}
@@ -145,6 +147,7 @@ const Login = () => {
                 {error}
               </div>
             )}
+
             <div>
               <label className="block text-sm font-medium mb-2">Email</label>
               <Input
@@ -160,7 +163,10 @@ const Login = () => {
             <div>
               <div className="flex justify-between items-center mb-2">
                 <label className="text-sm font-medium">Password</label>
-                <Link to="/forgot-password" className="text-sm text-primary hover:underline">
+                <Link
+                  to="/forgot-password"
+                  className="text-sm text-primary hover:underline"
+                >
                   Forgot password?
                 </Link>
               </div>
@@ -170,7 +176,9 @@ const Login = () => {
                   placeholder="Enter your password"
                   icon={<Lock className="w-4 h-4" />}
                   value={formData.password}
-                  onChange={(e) => setFormData({ ...formData, password: e.target.value })}
+                  onChange={(e) =>
+                    setFormData({ ...formData, password: e.target.value })
+                  }
                   required
                 />
                 <button
@@ -178,7 +186,11 @@ const Login = () => {
                   onClick={() => setShowPassword(!showPassword)}
                   className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                 >
-                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  {showPassword ? (
+                    <EyeOff className="w-4 h-4" />
+                  ) : (
+                    <Eye className="w-4 h-4" />
+                  )}
                 </button>
               </div>
             </div>
@@ -187,7 +199,9 @@ const Login = () => {
               <Checkbox
                 id="remember"
                 checked={formData.remember}
-                onCheckedChange={(checked) => setFormData({ ...formData, remember: checked as boolean })}
+                onCheckedChange={(checked) =>
+                  setFormData({ ...formData, remember: checked as boolean })
+                }
               />
               <label htmlFor="remember" className="text-sm text-muted-foreground">
                 Remember me for 30 days
@@ -212,25 +226,31 @@ const Login = () => {
             </Button>
           </form>
 
+          {/* Divider */}
           <div className="relative my-8">
             <div className="absolute inset-0 flex items-center">
               <div className="w-full border-t border-border" />
             </div>
             <div className="relative flex justify-center text-sm">
-              <span className="px-4 bg-background text-muted-foreground">Or continue with</span>
+              <span className="px-4 bg-background text-muted-foreground">
+                Or continue with
+              </span>
             </div>
           </div>
 
+          {/* Social login buttons */}
           <div className="grid grid-cols-2 gap-4">
             <Button variant="outline" size="lg">
               <Linkedin className="w-5 h-5 text-[#0A66C2]" />
               LinkedIn
             </Button>
+
             <Button
               variant="outline"
               size="lg"
               onClick={() => handleGoogleLogin()}
               disabled={googleLoading}
+              id="google-login-btn"
             >
               {googleLoading ? (
                 <div className="w-4 h-4 border-2 border-border border-t-foreground rounded-full animate-spin" />
@@ -243,7 +263,10 @@ const Login = () => {
 
           <p className="text-center text-muted-foreground mt-8">
             Don't have an account?{" "}
-            <Link to="/signup" className="text-primary hover:underline font-medium">
+            <Link
+              to="/signup"
+              className="text-primary hover:underline font-medium"
+            >
               Sign up
             </Link>
           </p>
