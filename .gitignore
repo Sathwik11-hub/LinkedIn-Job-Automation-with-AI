@@ -105,6 +105,8 @@ frontend/react/build/
 frontend/react/dist/
 frontend/react/.env
 frontend/lovable/dist/
+frontend/lovable/.env
+frontend/lovable/.env.local
 .env.production.local
 
 # Docker
