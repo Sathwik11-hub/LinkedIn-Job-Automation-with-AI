@@ -4,10 +4,14 @@ Playwright automation for fetching LinkedIn's recommended jobs list.
 """
 
 import os
+import sys
 import asyncio
 from typing import List, Dict, Set, Optional, Any
 from playwright.async_api import async_playwright, Page, Browser
 from dotenv import load_dotenv
+
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 load_dotenv()
 
