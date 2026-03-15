@@ -295,7 +295,7 @@ async def start_automation_v2(
     groq_api_key: str = Form(""),
     openai_api_key: str = Form(""),
     dry_run: str = Form("false"),  # CHANGED: Default to false (actually submit)
-    headless: str = Form("false"),
+    headless: str = Form("true"),
     resume: UploadFile = File(None)
 ):
     """V2: Start automation with multipart form data"""
@@ -467,7 +467,7 @@ async def run_playwright_subprocess(session_id: str, config: dict):
                 "location": config.get("location", "Remote"),
                 "max_applications": config.get("max_applications", 5),
                 "dry_run": config.get("dry_run", True),
-                "headless": config.get("headless", False),
+                "headless": config.get("headless", True),
                 "user_profile": config.get("user_profile", {}),
                 "resume_path": config.get("resume_path", ""),
                 "resume_text": config.get("resume_text", ""),

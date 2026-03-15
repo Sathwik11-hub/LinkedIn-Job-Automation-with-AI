@@ -15,6 +15,7 @@ import requests as http_requests
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
 
@@ -295,3 +296,13 @@ def google_auth(body: GoogleAuthRequest, db: Session = Depends(get_db)):
     # 4. Issue our JWT
     access_token = create_access_token(data={"sub": user.email})
     return LoginResponse(access_token=access_token)
+@router.post('/token', include_in_schema=False)
+async def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
+    user = UserRepository.get_by_email(db, email=form_data.username)
+    if not user or not verify_password(form_data.password, str(user.hashed_password)):
+        raise HTTPException(status_code=401, detail='Incorrect email or password')
+    access_token = create_access_token(data={'sub': user.email})
+    return {'access_token': access_token, 'token_type': 'bearer'}

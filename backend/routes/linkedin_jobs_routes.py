@@ -169,11 +169,13 @@ async def get_recommended_jobs(payload: RecommendedJobsRequest):
         }
         
     except Exception as e:
-        msg = str(e)
+        msg = str(e) or repr(e)
+        import traceback
         print(f"[JOBS] ERROR in recommended jobs endpoint: {msg}")
+        traceback.print_exc()
 
         # Common, expected user-facing failures should not crash the UI with 500s.
-        if "Login failed" in msg or "Login not confirmed" in msg or "checkpoint" in msg.lower() or "authwall" in msg.lower():
+        if isinstance(msg, str) and ("Login failed" in msg or "Login not confirmed" in msg or "checkpoint" in msg.lower() or "authwall" in msg.lower()):
             return {
                 "status": "error",
                 "total": 0,

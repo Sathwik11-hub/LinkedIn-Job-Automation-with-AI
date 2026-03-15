@@ -70,9 +70,11 @@ class LinkedInRecommendedJobsScraper:
         
     async def initialize_browser(self):
         """Launch browser with human-like configuration"""
+        from backend.config import settings
+        is_headless = settings.PLAYWRIGHT_HEADLESS
         self.playwright = await async_playwright().start()
         self.browser = await self.playwright.chromium.launch(
-            headless=False,  # Visible for debugging and CAPTCHA handling
+            headless=is_headless,
             args=[
                 '--disable-blink-features=AutomationControlled',
                 '--disable-dev-shm-usage',

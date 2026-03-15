@@ -3,7 +3,6 @@ Configuration management using Pydantic Settings.
 Loads environment variables and provides type-safe configuration.
 """
 import os
-import secrets
 from pathlib import Path
 from typing import List, Optional
 from pydantic import Field, validator
@@ -176,8 +175,10 @@ except Exception as e:
 
     _secret_key = os.environ.get("SECRET_KEY", "")
     if not _secret_key:
-        print("Warning: SECRET_KEY not found in environment. Generating a temporary secret key for this session.")
-        _secret_key = secrets.token_urlsafe(32)
+        raise RuntimeError(
+            "SECRET_KEY environment variable is required and must not be empty. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+        ) from e
 
     settings = Settings.model_construct(  # type: ignore[call-arg]
         APP_NAME=os.environ.get("APP_NAME", "AutoAgentHire"),
