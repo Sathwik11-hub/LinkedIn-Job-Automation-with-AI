@@ -260,10 +260,22 @@ export default function LinkedInAutomation() {
             setResults(resultsData.results);
             setShowResults(true);
 
-            toast({
-              title: 'Automation Complete',
-              description: `Applied to ${data.applications_submitted} jobs successfully`,
-            });
+            if (data.phase === 'no_jobs_found' || data.jobs_found === 0) {
+              toast({
+                title: 'No Jobs Found',
+                description: 'No Easy Apply jobs matched your search filters. Try broader keywords/location.',
+              });
+            } else if ((data.applications_submitted ?? 0) > 0) {
+              toast({
+                title: 'Automation Complete',
+                description: `Applied to ${data.applications_submitted} jobs successfully`,
+              });
+            } else {
+              toast({
+                title: 'Automation Completed',
+                description: `Found ${data.jobs_found ?? 0} jobs, but no applications were submitted. Check validation/filters and retry.`,
+              });
+            }
           } else {
             toast({
               title: 'Automation Failed',

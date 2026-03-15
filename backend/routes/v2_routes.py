@@ -129,10 +129,13 @@ def _ensure_v2_tables():
         return
     assert engine is not None and sql_text is not None
     try:
+        is_pg = getattr(engine, 'name', '') == 'postgresql'
+        pk_type = "SERIAL PRIMARY KEY" if is_pg else "INTEGER PRIMARY KEY"
+        
         with engine.connect() as conn:
-            conn.execute(sql_text("""
+            conn.execute(sql_text(f"""
                 CREATE TABLE IF NOT EXISTS v2_agent_runs (
-                    id INTEGER PRIMARY KEY,
+                    id {pk_type},
                     session_id TEXT UNIQUE NOT NULL,
                     status TEXT DEFAULT 'pending',
                     keyword TEXT,
@@ -146,9 +149,9 @@ def _ensure_v2_tables():
                     completed_at TIMESTAMP
                 )
             """))
-            conn.execute(sql_text("""
+            conn.execute(sql_text(f"""
                 CREATE TABLE IF NOT EXISTS v2_applications (
-                    id INTEGER PRIMARY KEY,
+                    id {pk_type},
                     session_id TEXT NOT NULL,
                     job_title TEXT,
                     company_name TEXT,
@@ -159,9 +162,9 @@ def _ensure_v2_tables():
                     form_data TEXT
                 )
             """))
-            conn.execute(sql_text("""
+            conn.execute(sql_text(f"""
                 CREATE TABLE IF NOT EXISTS v2_user_profiles (
-                    id INTEGER PRIMARY KEY,
+                    id {pk_type},
                     session_id TEXT NOT NULL,
                     first_name TEXT,
                     last_name TEXT,
@@ -468,6 +471,7 @@ async def run_playwright_subprocess(session_id: str, config: dict):
                 "user_profile": config.get("user_profile", {}),
                 "resume_path": config.get("resume_path", ""),
                 "resume_text": config.get("resume_text", ""),
+                "ai_config": config.get("ai_config", {}),
             }
             
             config_json = json.dumps(subprocess_config)
@@ -506,6 +510,8 @@ async def run_playwright_subprocess(session_id: str, config: dict):
                 stderr=subprocess.STDOUT,
                 cwd=str(Path(__file__).parent.parent.parent),
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
                 env=subprocess_env,
             )
@@ -558,6 +564,7 @@ async def run_playwright_subprocess(session_id: str, config: dict):
                     task["error"] = line_str.split("[FATAL]")[-1].strip()[:200] if "[FATAL]" in line_str else line_str[:200]
             
             process.wait()
+            return_code = process.returncode
             
             # Parse result JSON from output - find the JSON block after ===RESULT_JSON===
             result_json = None
@@ -579,6 +586,15 @@ async def run_playwright_subprocess(session_id: str, config: dict):
             if result_json:
                 try:
                     result = json.loads(result_json)
+                    task["jobs_found"] = int(result.get("jobs_found", task.get("jobs_found", 0)) or 0)
+                    task["total_jobs"] = min(task["jobs_found"], int(config.get("max_applications", 5) or 5))
+                    if result.get("errors"):
+                        try:
+                            first_error = result.get("errors", [""])[0]
+                            if first_error:
+                                task["error"] = str(first_error)[:200]
+                        except Exception:
+                            pass
                     app_results = []
                     for app in result.get("applications", []):
                         raw_status = app.get("status", "FAILED")
@@ -601,9 +617,21 @@ async def run_playwright_subprocess(session_id: str, config: dict):
                 except json.JSONDecodeError as e:
                     print(f"Failed to parse result JSON: {e}")
                     pass
-            
-            task["status"] = "completed"
-            task["phase"] = "finished"
+
+            if return_code != 0:
+                task["status"] = "failed"
+                task["phase"] = "failed"
+                if not task.get("error"):
+                    task["error"] = f"Playwright subprocess exited with code {return_code}"
+            elif task.get("error"):
+                task["status"] = "failed"
+                task["phase"] = "failed"
+            elif task.get("jobs_found", 0) == 0:
+                task["status"] = "completed"
+                task["phase"] = "no_jobs_found"
+            else:
+                task["status"] = "completed"
+                task["phase"] = "finished"
             _complete_agent_run(session_id, task)
             
             print(f"\n{'='*60}")

@@ -109,47 +109,69 @@ def _call_ai_sync(prompt: str) -> str:
     cfg = _get_ai_config()
     if not cfg:
         return ""
+    
+    # Provider-specific payload construction
     if cfg.get("provider") == "gemini":
+        url = f"{cfg['url']}?key={cfg['key']}"
+        headers = {"Content-Type": "application/json"}
         body = json.dumps({
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
-                "temperature": 0.3,
-                "maxOutputTokens": 150,
+                "temperature": 0.2, # Lower temp for more deterministic form filling
+                "maxOutputTokens": 100,
             },
         }).encode()
-    else:
+    elif cfg.get("provider") == "groq":
+        url = cfg["url"]
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {cfg['key']}"
+        }
         body = json.dumps({
             "model": cfg["model"],
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 150,
-            "temperature": 0.3,
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant filling out job application forms. Output ONLY the answer value."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 100,
+            "temperature": 0.1,
+        }).encode()
+    else: # OpenAI / default
+        url = cfg["url"]
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {cfg['key']}"
+        }
+        body = json.dumps({
+            "model": cfg["model"],
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant filling out job application forms. Output ONLY the answer value."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 100,
+            "temperature": 0.2,
         }).encode()
 
-    req = urllib.request.Request(
-        cfg["url"] + (f"?key={cfg['key']}" if cfg.get("provider") == "gemini" else ""),
-        data=body,
-        headers={
-            "Content-Type":  "application/json",
-            **({"Authorization": f"Bearer {cfg['key']}"} if cfg.get("provider") != "gemini" else {}),
-        },
-        method="POST",
-    )
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     ctx = ssl.create_default_context()
+    
     try:
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-            data = json.loads(resp.read().decode())
-            if cfg.get("provider") == "gemini":
-                ans = (
-                    data.get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text", "")
-                ).strip().strip("\"'`")
-            else:
-                ans = data["choices"][0]["message"]["content"].strip().strip("\"'`")
-            if "\n" in ans:
-                ans = ans.split("\n")[0].strip()
-            return ans
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+            if 200 <= resp.status < 300:
+                data = json.loads(resp.read().decode())
+                if cfg.get("provider") == "gemini":
+                    ans = (
+                        data.get("candidates", [{}])[0]
+                        .get("content", {})
+                        .get("parts", [{}])[0]
+                        .get("text", "")
+                    )
+                else:
+                    ans = data["choices"][0]["message"]["content"]
+                
+                return ans.strip().strip("\"'`")
+            print(f"    [AI] HTTP {resp.status} Error")
+            return ""
     except Exception as e:
         print(f"    [AI] API error: {str(e)[:80]}")
         return ""
@@ -166,77 +188,79 @@ async def ai_answer_field(
 ) -> str:
     """Generate a concise answer for an unknown form field.
     Called AT MOST ONCE per unique label (result is cached)."""
+    
+    # 1. Check cache first
     key = f"{label.lower().strip()}::{field_type}"
     if key in _ai_cache:
         return _ai_cache[key]
 
-    profile_lines = "\n".join(
-        f"  {k}: {v}"
-        for k, v in {
-            "Name":       user_profile.get("full_name", ""),
-            "Email":      user_profile.get("email", ""),
-            "Phone":      user_profile.get("phone_number", ""),
-            "City":       user_profile.get("city", ""),
-            "State":      user_profile.get("state", ""),
-            "Country":    user_profile.get("country", ""),
-            "Title":      user_profile.get("current_title", ""),
-            "Company":    user_profile.get("current_company", ""),
-            "Experience": f"{user_profile.get('years_experience', '')} years",
-            "Skills":     user_profile.get("skill_set", ""),
-            "Education":  user_profile.get("education_level", ""),
-            "College":    user_profile.get("college", ""),
-            "GPA":        str(user_profile.get("gpa", "")),
-        }.items()
-        if v and str(v).strip()
-    )
-
-    hint_line = f'\nValidation hint from site: "{validation_hint}"' if validation_hint else ""
-
+    # 2. Build Rich Context Profile
+    # combines explicit profile fields + some computed ones
+    profile_dump = json.dumps(user_profile, indent=2, default=str)
+    
+    # 3. Construct System/User Prompt
+    # We use a structured prompt to force the LLM to behave like a form-filler
+    
+    type_instruction = ""
     if field_type == "numeric":
-        type_rule = "Return ONLY digits (or digits with one decimal point)."
-    elif field_type == "dropdown" and options:
-        type_rule = "Return ONLY one of these options exactly: " + ", ".join(options[:20])
+        type_instruction = "IMPORTANT: Return ONLY a number. No text, no symbols. For salary/CTC, provide a realistic annual figure (e.g., 80000 or 500000). Never return 0."
     elif field_type == "yes_no":
-        type_rule = "Return ONLY Yes or No."
+        type_instruction = "IMPORTANT: Return ONLY 'Yes' or 'No'."
+    elif field_type == "date":
+        type_instruction = "IMPORTANT: Return date in MM/DD/YYYY format."
+    elif field_type == "dropdown" and options:
+        opts_str = ", ".join([f"'{o}'" for o in options[:60]]) # limit options length
+        type_instruction = f"IMPORTANT: You MUST choose exactly one option from this list: [{opts_str}]. Return ONLY the option text."
     else:
-        type_rule = "Return a short professional answer (1 to 10 words)."
+        type_instruction = "Keep the answer concise and professional. Do not add conversational text."
 
-    prompt = (
-        "You are filling a job-application form. Return ONLY the value to type "
-        "into the field – no explanation, no quotes, no extra text.\n\n"
-        f'Field label: "{label}"\n'
-        f'Field type: "{field_type}"\n'
-        f'Job title being applied for: "{job_title}"\n'
-        f"Applicant profile:\n{profile_lines}\n"
-    )
-    if resume_text:
-        prompt += f"\nResume excerpt:\n{resume_text[:600]}\n"
-    prompt += hint_line
-    prompt += (
-        "\n\nRules:\n"
-        f"- {type_rule}\n"
-        "- Date field (DOB) → use MM/DD/YYYY. Estimate from experience years.\n"
-        "- Yes/No → return Yes or No.\n"
-        "- City/State → use applicant location.\n"
-        "- College/University → use resume data or return a plausible name.\n"
-        "- Short text (cover letter, reason) → 1-2 sentences max.\n"
-        "- If truly unknown, return an empty response.\n"
-        "Return ONLY the value."
-    )
+    prompt = f"""
+You are an intelligent AI assistant helping a candidate apply for a job.
+Your task is to provide the CONTENT for a single form field based on the candidate's profile and resume.
 
+--- JOB CONTEXT ---
+Job Title: {job_title}
+
+--- CANDIDATE PROFILE ---
+{profile_dump}
+
+--- RESUME EXCERPT ---
+{resume_text[:2500]}
+
+--- FIELD TO FILL ---
+Label: "{label}"
+Type: {field_type}
+Validation Hint: "{validation_hint}"
+{f"Options: {options}" if options else ""}
+
+--- INSTRUCTIONS ---
+1. Analyze the 'Label' and 'Validation Hint' to understand what is asked.
+2. Search the Candidate Profile and Resume for the answer.
+3. If the answer is not explicitly found, make a reasonable, professional guess based on the candidate's background.
+   - For Salary/CTC: If 'INR' or 'Rupees' is mentioned, assume Indian Rupees (e.g., 600000 for 6LPA). If '$' or 'USD', assume US Dollars (e.g., 80000). If unspecified, guess based on location.
+   - For Experience: Calculate numeric years from resume history.
+   - For Notice Period: Default to '15' or '30' days if unknown.
+4. {type_instruction}
+5. OUTPUT ONLY THE VALUE. No markdown, no quotes, no explanations.
+"""
+
+    # 4. Call AI (in a thread to avoid blocking loop)
     try:
         ans = await asyncio.to_thread(_call_ai_sync, prompt)
     except Exception as e:
         print(f"    [AI] thread error: {str(e)[:50]}")
         ans = ""
 
-    ans = _sanitize_ai_answer(ans, field_type, options)
-    _ai_cache[key] = ans
-    if ans:
-        print(f"    [AI] '{label[:40]}' → '{ans[:35]}'")
+    # 5. Sanitize and Cache
+    final_ans = _sanitize_ai_answer(ans, field_type, options)
+    _ai_cache[key] = final_ans
+    
+    if final_ans:
+        print(f"    [AI] '{label[:30]}...' -> '{final_ans[:30]}...'")
     else:
-        print(f"    [AI] '{label[:40]}' → (no answer)")
-    return ans
+        print(f"    [AI] '{label[:30]}...' -> (no answer)")
+        
+    return final_ans
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -602,15 +626,19 @@ def _resolve_yes_no(label: str, profile: dict) -> str:
                               "completed", "degree", "bachelor", "master",
                               "proficient", "fluent", "experience with")):
         return "yes"
+    if any(x in lb for x in ("consent", "agree", "allow", "privacy", "policy", "contact me")):
+        return "yes"
     return "yes"
 
 
 def _infer_field_type(label: str) -> str:
     lb = (label or "").lower()
-    if any(x in lb for x in ("are you", "do you", "have you", "will you", "can you", "willing", "authorized", "sponsorship")):
+    if any(x in lb for x in ("are you", "do you", "have you", "will you", "can you", "willing", "authorized", "eligible", "require", "need", "legally", "consent", "agree", "allow")):
         return "yes_no"
-    if any(x in lb for x in ("year", "years", "experience", "salary", "ctc", "compensation", "cgpa", "gpa", "grade", "percentage", "notice")):
+    if any(x in lb for x in ("year", "years", "experience", "salary", "ctc", "compensation", "cgpa", "gpa", "grade", "percentage", "notice", "number", "mobile", "phone")):
         return "numeric"
+    if any(x in lb for x in ("date", "dob", "birth", "since", "until", "when")):
+        return "date"
     return "text"
 
 
@@ -618,46 +646,110 @@ def _sanitize_ai_answer(answer: str, field_type: str, options: list[str] | None 
     a = (answer or "").strip().strip('"\'`')
     if not a:
         return ""
+    
+    # ── Numeric ──
+    if field_type == "numeric":
+        # extract first valid number
+        m = re.search(r"-?\d+(?:,\d{3})*(?:\.\d+)?", a)
+        if m:
+            val = m.group(0).replace(",", "")
+            return val
+        return ""
+
+    # ── Yes/No ──
     if field_type == "yes_no":
         low = a.lower()
-        if low in ("yes", "y", "true", "1"):
+        if any(x in low for x in ("yes", "true", "sure", "correct", "agree")):
             return "yes"
-        if low in ("no", "n", "false", "0"):
+        if any(x in low for x in ("no", "false", "not", "deny")):
             return "no"
-        return ""
-    if field_type == "numeric":
-        m = re.search(r"\d+(?:\.\d+)?", a)
-        return m.group(0) if m else ""
+        # fallback simple check
+        return "yes" if len(low) < 5 and "y" in low else "no"
+
+    # ── Date ──
+    if field_type == "date":
+        # Extract MM/DD/YYYY
+        m = re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", a)
+        return m.group(0) if m else a
+
+    # ── Dropdown ──
     if field_type == "dropdown" and options:
         al = a.lower()
+        # 1. Exact match (case-insensitive)
         for opt in options:
-            ol = opt.lower().strip()
-            if al == ol:
+            if al == opt.lower().strip():
                 return opt
+        
+        # 2. Substring match (if unique)
+        matches = [o for o in options if al in o.lower() or o.lower() in al]
+        if len(matches) == 1:
+            return matches[0]
+        
+        # 3. Token overlap (simple heuristic)
+        best_opt = None
+        best_score = 0
+        a_tokens = set(al.split())
         for opt in options:
-            ol = opt.lower().strip()
-            if al in ol or ol in al:
-                return opt
+            opt_tokens = set(opt.lower().split())
+            score = len(a_tokens & opt_tokens)
+            if score > best_score:
+                best_score = score
+                best_opt = opt
+        if best_opt and best_score > 0:
+            return best_opt
+
+        # 4. Fallback: First option if AI returned something reasonable but unmatched
         return ""
-    return a[:120]
+
+    return a[:500]  # Allow longer text for cover letters etc.
 
 
 def _fallback_unknown_answer(label: str, profile: dict, field_type: str) -> str:
     lb = (label or "").lower()
+    
+    # Yes / No defaults
     if field_type == "yes_no":
         return "yes"
+    
+    # Numeric Defaults
     if field_type == "numeric":
+        # Notice Period
+        if "notice" in lb or "days" in lb:
+            return "15" # Default 15 days
+            
+        # Experience / Years
+        if "experience" in lb or "year" in lb or "months" in lb:
+             # Try to get real experience, default to at least 1 for entry level
+            years = str(profile.get("years_experience") or "1")
+            if "month" in lb:
+                return str(int(float(years) * 12)) if years.replace('.','',1).isdigit() else "12"
+            return years
+
+        # Salary / CTC (Crucial fix for >100 validation errors)
+        if any(x in lb for x in ("salary", "ctc", "compensation", "pay", "remuneration")):
+            # Check context -> INR vs USD
+            if "inr" in lb or "rupee" in lb or "lakh" in lb:
+                return "600000"  # Safe default 6 LPA base
+            if "usd" in lb or "$" in lb:
+                return "60000"   # Safe default 60k USD
+            # Generic safe integer > 100
+            val = str(profile.get("expected_salary") or profile.get("expected_ctc") or "50000")
+            return val if val != "0" else "50000"
+            
+        # CGPA / Percentage
         if "cgpa" in lb or "gpa" in lb:
-            return str(profile.get("cgpa") or profile.get("gpa") or "8")
-        if "experience" in lb or "year" in lb:
-            return str(profile.get("years_experience") or "1")
-        if "salary" in lb or "ctc" in lb or "compensation" in lb:
-            return str(profile.get("expected_salary") or profile.get("expected_ctc") or "0")
-        return "1"
+            return str(profile.get("gpa") or "8.0")
+        if "percentage" in lb or "marks" in lb:
+            return "75" # Safe average
+            
+        return "1" # Fallback for unknown numeric fields
+
+    # Text Defaults
     if "experience" in lb and profile.get("years_experience"):
         return f"{profile.get('years_experience')} years"
     if "skill" in lb and profile.get("skill_set"):
         return str(profile.get("skill_set"))[:120]
+        
     return "Yes"
 
 
@@ -1000,23 +1092,51 @@ async def fill_form_sections(
                 selected = False
                 for r in radios:
                     try:
+                        # Check value attribute
+                        val = (await r.get_attribute("value") or "").lower().strip()
+                        # Check label text (via our helper)
                         rl = (await get_field_label(page, r)).lower()
-                        if desired == "yes" and "yes" in rl:
+                        # Check parent text content as fallback (often 'Yes' is just text next to input)
+                        parent_text = await r.evaluate("el => el.parentElement ? el.parentElement.textContent.trim().toLowerCase() : ''")
+
+                        is_yes = (desired == "yes" and ("yes" in val or "true" in val or "yes" in rl or "yes" in parent_text))
+                        is_no  = (desired == "no"  and ("no" in val  or "false" in val or "no" in rl  or "no" in parent_text))
+
+                        if is_yes:
                             await r.check(timeout=FIELD_TIMEOUT)
                             selected = True
                             break
-                        elif desired == "no" and "no" in rl:
+                        elif is_no:
                             await r.check(timeout=FIELD_TIMEOUT)
                             selected = True
                             break
                     except Exception:
                         continue
+                
+                # Double-check specific strict matching if loose matching failed
+                if not selected:
+                    for r in radios:
+                        try:
+                            # Strict check for "Yes" text node next to input
+                            text_node = await r.evaluate("el => el.nextSibling ? el.nextSibling.textContent.trim().toLowerCase() : ''")
+                            if desired == "yes" and text_node == "yes":
+                                await r.check(timeout=FIELD_TIMEOUT)
+                                selected = True; break
+                            if desired == "no" and text_node == "no":
+                                await r.check(timeout=FIELD_TIMEOUT)
+                                selected = True; break
+                        except Exception: pass
+
                 if not selected and radios:
-                    try:
-                        await radios[0].check(timeout=FIELD_TIMEOUT)
-                        selected = True
-                    except Exception:
-                        pass
+                    # Final fallback: just click the first one (usually 'Yes') for consent forms
+                    # But only if it's likely a consent question
+                    if any(x in q for x in ("consent", "agree", "allow", "privacy")):
+                        try:
+                            await radios[0].check(timeout=FIELD_TIMEOUT)
+                            selected = True
+                        except Exception:
+                            pass
+                
                 if selected:
                     filled += 1
                     tracker.mark_done(fid, desired)
@@ -1059,7 +1179,7 @@ async def _fill_select_dropdowns(page, profile, tracker, job_title="", resume_te
                 if tracker.is_done(fid):
                     continue
                 cur = (await sel.input_value() or "").strip()
-                if cur:
+                if cur and cur.lower() not in ("select an option", "select", "choose", "", "--", "please select"):
                     tracker.mark_done(fid, cur)
                     continue
                 opts = await sel.query_selector_all("option")
@@ -1251,7 +1371,7 @@ async def _pick_dropdown_value(label, options, profile) -> str:
     # generic: first non-placeholder option
     for o in options[1:]:
         v = await o.get_attribute("value")
-        if v and v.strip() and v.lower() not in ("", "select", "choose", "-1"):
+        if v and v.strip() and v.lower() not in ("", "select", "choose", "-1", "select an option", "please select"):
             return v
     return ""
 

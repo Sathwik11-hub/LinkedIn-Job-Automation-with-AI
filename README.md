@@ -1,6 +1,16 @@
-﻿🚀 AutoAgent Hire – LinkedIn Job Automation with AI
+﻿---
+title: LinkedIn Job Automation with AI
+emoji: 🚀
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+pinned: false
+app_port: 8000
+---
 
-Autonomous AI agent that discovers, fills, and submits LinkedIn Easy Apply jobs intelligently on your behalf.
+🚀 AutoAgent Hire – LinkedIn Job Automation with AI
+
+Autonomous AI agent that discovers, fills, and submitted LinkedIn Easy Apply jobs intelligently on your behalf.
 
 🌟 Quick Overview
 

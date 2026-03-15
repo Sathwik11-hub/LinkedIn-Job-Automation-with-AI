@@ -130,8 +130,91 @@ class VectorStoreManager:
             return self._fallback_embedding(text)
     
     def _fallback_embedding(self, text: str) -> np.ndarray:
-        """Simple fallback embedding when sentence-transformers unavailable"""
-        # Create a simple hash-based embedding (NOT recommended for production)
+        """Fallback to OpenAI/Gemini APIs if available, otherwise simple hash-based"""
+        import os
+        
+        # 1. Try OpenAI if API key exists
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if openai_key:
+            try:
+                import urllib.request
+                import json
+                req = urllib.request.Request(
+                    "https://api.openai.com/v1/embeddings",
+                    data=json.dumps({
+                        "model": "text-embedding-3-small",
+                        "input": text[:8000]
+                    }).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {openai_key}",
+                        "Content-Type": "application/json"
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    data = json.loads(response.read().decode())
+                    vec = data["data"][0]["embedding"]
+                    # Pad or truncate to self.dimension (usually 384)
+                    arr = np.zeros(self.dimension, dtype='float32')
+                    arr[:min(len(vec), self.dimension)] = vec[:self.dimension]
+                    norm = np.linalg.norm(arr)
+                    return arr / norm if norm > 0 else arr
+            except Exception as e:
+                print(f"[VS] Fallback OpenAI embedding failed: {e}")
+                
+        # 2. Try Gemini if API key exists  
+        gemini_key = os.getenv("GEMINI_API_KEY")      
+        if gemini_key:
+            try:
+                import urllib.request
+                import json
+                req = urllib.request.Request(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={gemini_key}",
+                    method="POST",
+                    data=json.dumps({
+                        "model": "models/text-embedding-004",
+                        "content": {"parts": [{"text": text[:8000]}]}
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    data = json.loads(response.read().decode())
+                    vec = data["embedding"]["values"]
+                    # Pad or truncate to self.dimension
+                    arr = np.zeros(self.dimension, dtype='float32')
+                    arr[:min(len(vec), self.dimension)] = vec[:self.dimension]
+                    norm = np.linalg.norm(arr)
+                    return arr / norm if norm > 0 else arr
+            except Exception as e:
+                print(f"[VS] Fallback Gemini embedding failed: {e}")
+        
+        # 3. Try Groq if API key exists (using their embedding model)
+        groq_key = os.getenv("GROQ_API_KEY")
+        if groq_key:
+            try:
+                import urllib.request
+                import json
+                req = urllib.request.Request(
+                    "https://api.groq.com/openai/v1/embeddings",
+                    data=json.dumps({
+                        "model": "nomic-embed-text-v1.5",
+                        "input": text[:8000]
+                    }).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {groq_key}",
+                        "Content-Type": "application/json"
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode())
+                    vec = data["data"][0]["embedding"]
+                    arr = np.zeros(self.dimension, dtype='float32')
+                    arr[:min(len(vec), self.dimension)] = vec[:self.dimension]
+                    norm = np.linalg.norm(arr)
+                    return arr / norm if norm > 0 else arr
+            except Exception as e:
+                print(f"[VS] Fallback Groq embedding failed: {e}")
+
+        # 4. Absolute worst-case scenario: simple hash-based embedding (NOT recommended for production)
         words = text.lower().split()
         embedding = np.zeros(self.dimension, dtype='float32')
         for i, word in enumerate(words[:self.dimension]):

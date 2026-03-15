@@ -138,16 +138,89 @@ class QdrantVectorStore:
             self._model_loaded = True
 
     def _embed(self, text: str) -> Optional[List[float]]:
-        """Convert text to a 384-dim float vector."""
+        """Convert text to a 384-dim float vector.
+        Tries local model first, then API-based fallbacks."""
+        # Try local model first (fast but memory-heavy)
         self._load_model()
-        if self._embed_model is None:
-            return None
-        try:
-            vec = self._embed_model.encode(text, convert_to_numpy=True)
-            return vec.tolist()
-        except Exception as e:
-            print("[QD] ERROR - Embedding failed: " + str(e).splitlines()[0])
-            return None
+        if self._embed_model is not None:
+            try:
+                vec = self._embed_model.encode(text, convert_to_numpy=True)
+                return vec.tolist()
+            except Exception as e:
+                print("[QD] LOCAL embedding failed: " + str(e).splitlines()[0])
+        
+        # Fallback: Use OpenAI API
+        import urllib.request
+        import json
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if openai_key:
+            try:
+                req = urllib.request.Request(
+                    "https://api.openai.com/v1/embeddings",
+                    data=json.dumps({
+                        "model": "text-embedding-3-small",
+                        "input": text[:8000]
+                    }).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {openai_key}",
+                        "Content-Type": "application/json"
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    data = json.loads(response.read().decode())
+                    return data["data"][0]["embedding"]
+            except Exception as e:
+                print(f"[QD] OpenAI embedding failed: {str(e).splitlines()[0]}")
+        
+        # Fallback: Use Gemini API
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if gemini_key:
+            try:
+                req = urllib.request.Request(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={gemini_key}",
+                    method="POST",
+                    data=json.dumps({
+                        "model": "models/text-embedding-004",
+                        "content": {"parts": [{"text": text[:8000]}]}
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    data = json.loads(response.read().decode())
+                    return data["embedding"]["values"]
+            except Exception as e:
+                print(f"[QD] Gemini embedding failed: {str(e).splitlines()[0]}")
+        
+        # Fallback 3: Use Groq API (using their embedding model)
+        groq_key = os.getenv("GROQ_API_KEY")
+        if groq_key:
+            try:
+                req = urllib.request.Request(
+                    "https://api.groq.com/openai/v1/embeddings",
+                    data=json.dumps({
+                        "model": "nomic-embed-text-v1.5",
+                        "input": text[:8000]
+                    }).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {groq_key}",
+                        "Content-Type": "application/json"
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    data = json.loads(response.read().decode())
+                    return data["data"][0]["embedding"]
+            except Exception as e:
+                print(f"[QD] Groq embedding failed: {str(e).splitlines()[0]}")
+        
+        # No model and no API configured
+        print("[QD] WARNING - No embedding method available, using hash-based fallback")
+        words = text.lower().split()
+        embedding = [0.0] * 384
+        for i, word in enumerate(words[:384]):
+            embedding[hash(word) % 384] += 1.0
+        # Normalize
+        norm = sum(x**2 for x in embedding) ** 0.5
+        return [x / norm if norm > 0 else 0.0 for x in embedding]
 
     # ------------------------------------------------------------------
     # Resume Operations

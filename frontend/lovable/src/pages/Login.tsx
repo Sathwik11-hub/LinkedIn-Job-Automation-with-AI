@@ -41,33 +41,41 @@ const Login = () => {
     remember: false,
   });
 
-  const handleGoogleLogin = useGoogleLogin({
-    scope: "openid profile email",
-    onSuccess: async (tokenResponse) => {
-      setGoogleLoading(true);
-      setError(null);
-      try {
-        const response = await apiClient.post(API_ENDPOINTS.auth.google, {
-          access_token: tokenResponse.access_token,
-        });
-        const { access_token } = response.data;
-        localStorage.setItem("authToken", access_token);
-        navigate("/dashboard");
-      } catch (err: any) {
-        const detail =
-          err?.response?.data?.detail ||
-          err?.message ||
-          "Google sign-in failed. Please try again.";
-        setError(detail);
-      } finally {
-        setGoogleLoading(false);
-      }
-    },
-    onError: (err: any) => {
-      const msg = err?.error_description || err?.error || "Google sign-in was cancelled or failed.";
-      setError(msg);
-    },
-  });
+  let handleGoogleLogin: () => void = () => {
+    setError("Google sign-in is currently unavailable. Please configure VITE_GOOGLE_CLIENT_ID.");
+  };
+
+  try {
+    handleGoogleLogin = useGoogleLogin({
+      scope: "openid profile email",
+      onSuccess: async (tokenResponse) => {
+        setGoogleLoading(true);
+        setError(null);
+        try {
+          const response = await apiClient.post(API_ENDPOINTS.auth.google, {
+            access_token: tokenResponse.access_token,
+          });
+          const { access_token } = response.data;
+          localStorage.setItem("authToken", access_token);
+          navigate("/dashboard");
+        } catch (err: any) {
+          const detail =
+            err?.response?.data?.detail ||
+            err?.message ||
+            "Google sign-in failed. Please try again.";
+          setError(detail);
+        } finally {
+          setGoogleLoading(false);
+        }
+      },
+      onError: (err: any) => {
+        const msg = err?.error_description || err?.error || "Google sign-in was cancelled or failed.";
+        setError(msg);
+      },
+    });
+  } catch {
+    // Keep page usable even if Google OAuth setup fails.
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
