@@ -73,7 +73,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
     APP_ENV=production \
     DEBUG=false \
-    PORT=8000
+    PORT=7860
 
 # ── Copy application code ─────────────────────────────────────────────────────
 COPY backend/ ./backend/
@@ -91,21 +91,22 @@ RUN mkdir -p \
     data/templates \
     data/vectors \
     uploads/resumes \
-    vector_db/data
+    vector_db/data && \
+    chmod -R 777 data uploads vector_db
 
 # ── Health check ──────────────────────────────────────────────────────────────
 HEALTHCHECK --interval=30s --timeout=15s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:7860/health || exit 1
 
 # ── Expose port ───────────────────────────────────────────────────────────────
-EXPOSE 8000
+EXPOSE 7860
 
 # ── Start gunicorn with UvicornWorker ─────────────────────────────────────────
 # 1 worker — Playwright is not multi-process safe in same address space
 CMD ["gunicorn", "backend.main:app", \
      "--workers", "1", \
      "--worker-class", "uvicorn.workers.UvicornWorker", \
-     "--bind", "0.0.0.0:8000", \
+     "--bind", "0.0.0.0:7860", \
      "--timeout", "300", \
      "--graceful-timeout", "30", \
      "--keep-alive", "75", \
